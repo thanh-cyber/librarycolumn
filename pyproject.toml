@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "librarycolumn"
+version = "0.1.0"
+description = "Portable modular OHLCV column library for backtesting workflows"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "thanh-cyber" }]
+license = { text = "MIT" }
+dependencies = [
+    "pandas>=2.0,<3",
+    "numpy>=1.24",
+    "pandas_ta>=0.4.71b0",
+]
+keywords = ["trading", "backtesting", "feature-engineering", "pandas", "ta"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Financial and Insurance Industry",
+]
+
+[tool.setuptools]
+py-modules = ["column_library"]
+
+[project.urls]
+Homepage = "https://github.com/thanh-cyber/librarycolumn"
+Repository = "https://github.com/thanh-cyber/librarycolumn"
