@@ -54,9 +54,12 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_ATR14",
         "Col_NormalizedATR_Pct",
         "Col_ATR_vs_20dayAvg_Pct",
+        "Col_ATR14_vs_5dayAvg_Pct",
         "Col_HistoricalVol_20day",
         "Col_TrueRange_vs_ATR",
         "Col_DailyRange_vs_ATR_Pct",
+        "Col_RangeExpansionToday_Pct",
+        "Col_VolatilityRatio_20_5",
     ],
     "trend_momentum": [
         "Col_DistTo50MA_ATR",
@@ -69,6 +72,7 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_ROC10",
         "Col_ROC20",
         "Col_20dayLinReg_Slope_ATR",
+        "Col_ExtensionFromOpen_ATR",
     ],
     "oscillators": [
         "Col_RSI14",
@@ -81,26 +85,20 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
     ],
     "volume_vwap": [
         "Col_RelativeVolume",
+        "Col_RelativeVolume_5min",
         "Col_TodayVol_vs_YestVol",
+        "Col_VolumeSurge_15min_Pct",
+        "Col_CumulativeVol_vs_Avg_Pct",
         "Col_OBV_Slope5",
         "Col_AccumDist",
         "Col_VWAP_Deviation_ATR",
         "Col_VWAP_Deviation_Pct",
-        "Col_VWAP_AbsExtension_ATR",
-        "Col_VWAP_Dist_1SD_ATR",
-        "Col_VWAP_Dist_m1SD_ATR",
-        "Col_VWAP_Dist_2SD_ATR",
-        "Col_VWAP_Dist_m2SD_ATR",
-        "Col_VWAP_SD_Multiples",
         "Col_VWAP_Slope10_ATR",
         "Col_VWAP_ROC5",
-        "Col_VWAP_PrevDayClose_Dist_ATR",
-        "Col_VWAP_WeeklyAnchored_Dist_ATR",
-        "Col_VWAP_Swing20_Dist_ATR",
-        "Col_VWAP_GapOpen_Dist_ATR",
         "Col_BarsSinceVWAP_Cross",
         "Col_VWAP_vs_Open_ATR",
         "Col_VWAP_PosIn2SD_Bands_Pct",
+        "Col_PreMarketVolume_Ratio",
     ],
     "price_action": [
         "Col_PctInYesterdayRange",
@@ -111,18 +109,19 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_Dist52wLow_ATR",
         "Col_OpenToClose_Pct_Sofar",
         "Col_CandleBody_vs_ATR",
+        "Col_MomentumScore_5min",
+        "Col_ConsecutiveUpBars",
+        "Col_BodyToRangeRatio",
     ],
     "gaps": [
         "Col_Gap_Pct",
         "Col_Gap_ATR",
         "Col_PreMarketGap_ATR",
         "Col_GapFillProxy_ATR",
+        "Col_GapFillProbability_Proxy",
     ],
     "key_levels": [
         "Col_DistNearestRound_ATR",
-        "Col_DistPivotR1S1_ATR",
-        "Col_DistSwingHigh5_ATR",
-        "Col_DistSwingLow5_ATR",
     ],
     "market_context": [
         "Col_StockVsSPX_TodayPct",
@@ -130,19 +129,11 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_Beta60d",
         "Col_CorrToSPY_10d",
     ],
-    "risk_intra": [
-        "Col_DistToInitialStop_R",
-        "Col_UnrealizedPL_Noon",
-        "Col_UnrealizedPL_2pm",
-        "Col_UnrealizedPL_30minBeforeClose",
-        "Col_MaxFavorableExcursion_R",
-        "Col_BarsSinceEntry",
-        "Col_PosSize_PctAccount",
-    ],
     "time": [
         "Col_EntryTime_HourNumeric",
         "Col_DayOfWeek",
         "Col_SessionFlag",
+        "Col_MinutesSinceOpen",
     ],
 }
 
@@ -266,56 +257,6 @@ def _bars_since_event(event: pd.Series) -> pd.Series:
     return bars
 
 
-def _derive_trade_id(df: pd.DataFrame) -> pd.Series:
-    if "TradeID" in df.columns:
-        trade_id = df["TradeID"].astype("float")
-        trade_id = trade_id.where(trade_id > 0, np.nan)
-        return trade_id
-
-    if "IsEntry" in df.columns:
-        is_entry = df["IsEntry"].fillna(0).astype(int) == 1
-        trade_id = is_entry.cumsum().astype(float)
-        trade_id[trade_id == 0] = np.nan
-        return trade_id
-
-    if "EntryPrice" in df.columns:
-        entry = df["EntryPrice"]
-        new_trade = entry.notna() & entry.ne(entry.shift(1))
-        trade_id = new_trade.cumsum().astype(float)
-        trade_id[~entry.notna()] = np.nan
-        trade_id[trade_id == 0] = np.nan
-        return trade_id
-
-    return pd.Series(np.nan, index=df.index)
-
-
-def _trade_side_multiplier(df: pd.DataFrame) -> pd.Series:
-    if "Side" in df.columns:
-        side = df["Side"].astype(str).str.lower()
-        mult = np.where(side.str.contains("short"), -1.0, 1.0)
-        return pd.Series(mult, index=df.index)
-    return pd.Series(1.0, index=df.index)
-
-
-def _snapshot_r_at_time(
-    df: pd.DataFrame,
-    r_now: pd.Series,
-    target_hour: int,
-    target_minute: int,
-) -> pd.Series:
-    if not _is_intraday(df.index):
-        return r_now.copy()
-
-    session = _session_labels(df.index)
-    hhmm = df.index.hour * 100 + df.index.minute
-    target_hhmm = target_hour * 100 + target_minute
-    mask = hhmm >= target_hhmm
-
-    subset = r_now.where(mask)
-    snap_by_session = subset.groupby(session).first()
-    return session.map(snap_by_session)
-
-
 # ====================== VOLATILITY & NORMALIZATION ======================
 def add_volatility_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
     out = _copy_if_needed(df, inplace)
@@ -324,6 +265,7 @@ def add_volatility_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFr
     out["Col_ATR14"] = ta.atr(out["High"], out["Low"], out["Close"], length=14)
     out["Col_NormalizedATR_Pct"] = _safe_div(out["Col_ATR14"], out["Close"]) * 100.0
     out["Col_ATR_vs_20dayAvg_Pct"] = _safe_div(out["Col_ATR14"], out["Col_ATR14"].rolling(20).mean()) * 100.0
+    out["Col_ATR14_vs_5dayAvg_Pct"] = _safe_div(out["Col_ATR14"], out["Col_ATR14"].rolling(5).mean()) * 100.0
 
     log_ret = np.log(_safe_div(out["Close"], out["Close"].shift(1)))
     out["Col_HistoricalVol_20day"] = log_ret.rolling(20).std() * np.sqrt(252.0) * 100.0
@@ -331,6 +273,11 @@ def add_volatility_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFr
     true_range = ta.true_range(out["High"], out["Low"], out["Close"])
     out["Col_TrueRange_vs_ATR"] = _safe_div(true_range, out["Col_ATR14"])
     out["Col_DailyRange_vs_ATR_Pct"] = _safe_div(out["High"] - out["Low"], out["Col_ATR14"]) * 100.0
+    daily_range = out["High"] - out["Low"]
+    out["Col_RangeExpansionToday_Pct"] = _safe_div(daily_range, daily_range.rolling(5).mean()) * 100.0
+    atr5 = ta.atr(out["High"], out["Low"], out["Close"], length=5)
+    atr20 = ta.atr(out["High"], out["Low"], out["Close"], length=20)
+    out["Col_VolatilityRatio_20_5"] = _safe_div(atr5, atr20)
     return out
 
 
@@ -363,6 +310,7 @@ def add_trend_momentum_columns(df: pd.DataFrame, inplace: bool = False) -> pd.Da
 
     linreg_20 = ta.linreg(out["Close"], length=20)
     out["Col_20dayLinReg_Slope_ATR"] = _atr_normalize(out, linreg_20 - linreg_20.shift(1))
+    out["Col_ExtensionFromOpen_ATR"] = _atr_normalize(out, out["Close"] - out["Open"])
     return out
 
 
@@ -413,13 +361,19 @@ def add_volume_vwap_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataF
     typical = (out["High"] + out["Low"] + out["Close"]) / 3.0
 
     out["Col_RelativeVolume"] = _safe_div(out["Volume"], out["Volume"].rolling(20).mean())
+    out["Col_RelativeVolume_5min"] = _safe_div(out["Volume"], out["Volume"].rolling(5).mean())
 
     if intraday:
         today_cum_vol = out["Volume"].groupby(session).cumsum()
         yest_total_vol = _session_prev_map(out["Volume"], agg="sum")
         out["Col_TodayVol_vs_YestVol"] = _safe_div(today_cum_vol, yest_total_vol)
+        bar_index = out.groupby(session).cumcount() + 1
+        expected_cum = today_cum_vol.groupby(bar_index).transform(lambda s: s.rolling(20, min_periods=5).mean())
+        out["Col_CumulativeVol_vs_Avg_Pct"] = _safe_div(today_cum_vol, expected_cum) * 100.0
     else:
         out["Col_TodayVol_vs_YestVol"] = _safe_div(out["Volume"], out["Volume"].shift(1))
+        out["Col_CumulativeVol_vs_Avg_Pct"] = _safe_div(out["Volume"], out["Volume"].rolling(20).mean()) * 100.0
+    out["Col_VolumeSurge_15min_Pct"] = _safe_div(out["Volume"], out["Volume"].rolling(15).mean()) * 100.0
 
     obv = ta.obv(out["Close"], out["Volume"])
     out["Col_OBV_Slope5"] = _safe_div(obv - obv.shift(5), out["Col_ATR14"])
@@ -435,32 +389,13 @@ def add_volume_vwap_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataF
 
     out["Col_VWAP_Deviation_ATR"] = _atr_normalize(out, out["Close"] - daily_vwap)
     out["Col_VWAP_Deviation_Pct"] = _safe_div(out["Close"] - daily_vwap, daily_vwap) * 100.0
-    out["Col_VWAP_AbsExtension_ATR"] = _atr_normalize(out, (out["Close"] - daily_vwap).abs())
 
     _, daily_vwap_std = _session_weighted_vwap_std(out)
-    vwap_p1 = daily_vwap + daily_vwap_std
-    vwap_m1 = daily_vwap - daily_vwap_std
     vwap_p2 = daily_vwap + 2.0 * daily_vwap_std
     vwap_m2 = daily_vwap - 2.0 * daily_vwap_std
 
-    out["Col_VWAP_Dist_1SD_ATR"] = _atr_normalize(out, out["Close"] - vwap_p1)
-    out["Col_VWAP_Dist_m1SD_ATR"] = _atr_normalize(out, out["Close"] - vwap_m1)
-    out["Col_VWAP_Dist_2SD_ATR"] = _atr_normalize(out, out["Close"] - vwap_p2)
-    out["Col_VWAP_Dist_m2SD_ATR"] = _atr_normalize(out, out["Close"] - vwap_m2)
-    out["Col_VWAP_SD_Multiples"] = _safe_div(out["Close"] - daily_vwap, daily_vwap_std)
-
     out["Col_VWAP_Slope10_ATR"] = _atr_normalize(out, daily_vwap - daily_vwap.shift(10))
     out["Col_VWAP_ROC5"] = daily_vwap.pct_change(5) * 100.0
-
-    prev_close = _session_prev_map(out["Close"], agg="last") if intraday else out["Close"].shift(1)
-    out["Col_VWAP_PrevDayClose_Dist_ATR"] = _atr_normalize(out, daily_vwap - prev_close)
-    out["Col_VWAP_WeeklyAnchored_Dist_ATR"] = _atr_normalize(out, out["Close"] - weekly_vwap)
-
-    swing20_vwap = _safe_div((typical * out["Volume"]).rolling(20).sum(), out["Volume"].rolling(20).sum())
-    out["Col_VWAP_Swing20_Dist_ATR"] = _atr_normalize(out, out["Close"] - swing20_vwap)
-
-    day_open = out["Open"].groupby(session).transform("first") if intraday else out["Open"]
-    out["Col_VWAP_GapOpen_Dist_ATR"] = _atr_normalize(out, daily_vwap - day_open)
 
     vwap_side = out["Close"] >= daily_vwap
     cross_event = vwap_side.ne(vwap_side.shift(1)).fillna(False)
@@ -468,6 +403,14 @@ def add_volume_vwap_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataF
 
     out["Col_VWAP_vs_Open_ATR"] = _atr_normalize(out, daily_vwap - out["Open"])
     out["Col_VWAP_PosIn2SD_Bands_Pct"] = _safe_div(out["Close"] - vwap_m2, vwap_p2 - vwap_m2) * 100.0
+    if intraday:
+        hhmm = out.index.hour + out.index.minute / 60.0
+        premarket = out["Volume"].where((hhmm >= 4.0) & (hhmm < 9.5), 0.0)
+        premarket_by_session = premarket.groupby(session).sum()
+        avg_premarket = premarket_by_session.rolling(20, min_periods=5).mean()
+        out["Col_PreMarketVolume_Ratio"] = _safe_div(session.map(premarket_by_session), session.map(avg_premarket))
+    else:
+        out["Col_PreMarketVolume_Ratio"] = np.nan
     return out
 
 
@@ -506,6 +449,11 @@ def add_price_action_columns(df: pd.DataFrame, inplace: bool = False) -> pd.Data
 
     out["Col_OpenToClose_Pct_Sofar"] = _safe_div(out["Close"] - out["Open"], out["Open"]) * 100.0
     out["Col_CandleBody_vs_ATR"] = _safe_div((out["Close"] - out["Open"]).abs(), out["Col_ATR14"])
+    out["Col_MomentumScore_5min"] = _atr_normalize(out, out["Close"] - out["Close"].shift(5))
+    up_bars = (out["Close"] > out["Open"]).astype(int)
+    up_groups = (up_bars == 0).cumsum()
+    out["Col_ConsecutiveUpBars"] = up_bars.groupby(up_groups).cumsum()
+    out["Col_BodyToRangeRatio"] = _safe_div((out["Close"] - out["Open"]).abs(), out["High"] - out["Low"])
     return out
 
 
@@ -523,6 +471,7 @@ def add_gaps_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
     out["Col_Gap_ATR"] = _atr_normalize(out, day_open - prev_close)
     out["Col_PreMarketGap_ATR"] = _atr_normalize(out, day_open - prev_close)
     out["Col_GapFillProxy_ATR"] = _atr_normalize(out, out["Close"] - prev_close)
+    out["Col_GapFillProbability_Proxy"] = _safe_div((day_open - prev_close).abs(), out["Col_ATR14"])
     return out
 
 
@@ -542,36 +491,6 @@ def add_key_levels_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFr
     nearest_round = (close / inc_series).round() * inc_series
     out["Col_DistNearestRound_ATR"] = _atr_normalize(out, close - nearest_round)
 
-    session = _session_labels(out.index)
-    intraday = _is_intraday(out.index)
-    if intraday:
-        p_high = _session_prev_map(out["High"], agg="max")
-        p_low = _session_prev_map(out["Low"], agg="min")
-        p_close = _session_prev_map(out["Close"], agg="last")
-    else:
-        p_high = out["High"].shift(1)
-        p_low = out["Low"].shift(1)
-        p_close = out["Close"].shift(1)
-
-    pivot = (p_high + p_low + p_close) / 3.0
-    r1 = 2.0 * pivot - p_low
-    s1 = 2.0 * pivot - p_high
-    d_pivot = close - pivot
-    d_r1 = close - r1
-    d_s1 = close - s1
-
-    dist_stack = pd.concat([d_pivot.abs(), d_r1.abs(), d_s1.abs()], axis=1)
-    valid_mask = dist_stack.notna().any(axis=1)
-    idx_min = pd.Series(np.nan, index=out.index)
-    idx_min.loc[valid_mask] = dist_stack.loc[valid_mask].idxmin(axis=1)
-    nearest = pd.Series(np.nan, index=out.index)
-    nearest[idx_min == 0] = d_pivot[idx_min == 0]
-    nearest[idx_min == 1] = d_r1[idx_min == 1]
-    nearest[idx_min == 2] = d_s1[idx_min == 2]
-    out["Col_DistPivotR1S1_ATR"] = _atr_normalize(out, nearest)
-
-    out["Col_DistSwingHigh5_ATR"] = _atr_normalize(out, close - out["High"].rolling(5).max())
-    out["Col_DistSwingLow5_ATR"] = _atr_normalize(out, close - out["Low"].rolling(5).min())
     return out
 
 
@@ -620,71 +539,6 @@ def add_market_context_columns(df: pd.DataFrame, inplace: bool = False) -> pd.Da
     return out
 
 
-# ====================== RISK & INTRA-TRADE / EXIT METRICS ======================
-def _compute_unrealized_r(df: pd.DataFrame) -> pd.Series:
-    required = {"EntryPrice", "InitialStop"}
-    if not required.issubset(df.columns):
-        return pd.Series(np.nan, index=df.index)
-
-    side_mult = _trade_side_multiplier(df)
-    entry = df["EntryPrice"].astype(float)
-    stop = df["InitialStop"].astype(float)
-    risk_per_share = (entry - stop).abs()
-
-    pnl_per_share = (df["Close"] - entry) * side_mult
-    return _safe_div(pnl_per_share, risk_per_share)
-
-
-def _compute_dist_to_stop_r(df: pd.DataFrame) -> pd.Series:
-    required = {"EntryPrice", "InitialStop"}
-    if not required.issubset(df.columns):
-        return pd.Series(np.nan, index=df.index)
-
-    side_mult = _trade_side_multiplier(df)
-    entry = df["EntryPrice"].astype(float)
-    stop = df["InitialStop"].astype(float)
-    risk_per_share = (entry - stop).abs()
-
-    # Remaining distance to stop in R units.
-    # Long: (Close - Stop) / risk ; Short: (Stop - Close) / risk
-    remaining = (df["Close"] - stop) * side_mult
-    return _safe_div(remaining, risk_per_share)
-
-
-def add_risk_intra_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
-    out = _copy_if_needed(df, inplace)
-    _validate_ohlcv_df(out)
-
-    r_now = _compute_unrealized_r(out)
-    out["Col_DistToInitialStop_R"] = _compute_dist_to_stop_r(out)
-    out["Col_UnrealizedPL_Noon"] = _snapshot_r_at_time(out, r_now, 12, 0)
-    out["Col_UnrealizedPL_2pm"] = _snapshot_r_at_time(out, r_now, 14, 0)
-    out["Col_UnrealizedPL_30minBeforeClose"] = _snapshot_r_at_time(out, r_now, 15, 30)
-
-    trade_id = _derive_trade_id(out)
-    out["Col_BarsSinceEntry"] = (
-        out.groupby(trade_id, dropna=True).cumcount().reindex(out.index).astype(float)
-        if trade_id.notna().any()
-        else np.nan
-    )
-
-    if trade_id.notna().any():
-        mfe = r_now.groupby(trade_id, dropna=True).cummax().reindex(out.index)
-        out["Col_MaxFavorableExcursion_R"] = mfe
-    else:
-        out["Col_MaxFavorableExcursion_R"] = np.nan
-
-    if {"Shares", "AccountSize", "EntryPrice"}.issubset(out.columns):
-        position_value = out["Shares"].abs() * out["EntryPrice"].abs()
-        out["Col_PosSize_PctAccount"] = _safe_div(position_value, out["AccountSize"]) * 100.0
-    elif {"PositionValue", "AccountSize"}.issubset(out.columns):
-        out["Col_PosSize_PctAccount"] = _safe_div(out["PositionValue"], out["AccountSize"]) * 100.0
-    else:
-        out["Col_PosSize_PctAccount"] = np.nan
-
-    return out
-
-
 # ====================== SIMPLE TIME / SESSION ======================
 def add_time_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
     out = _copy_if_needed(df, inplace)
@@ -706,6 +560,11 @@ def add_time_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
         )
     else:
         out["Col_SessionFlag"] = 2
+    if _is_intraday(out.index):
+        minutes = out.index.hour * 60 + out.index.minute
+        out["Col_MinutesSinceOpen"] = np.maximum(minutes - 570, 0)
+    else:
+        out["Col_MinutesSinceOpen"] = np.nan
     return out
 
 
@@ -722,7 +581,6 @@ def add_all_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
     out = add_gaps_columns(out, inplace=True)
     out = add_key_levels_columns(out, inplace=True)
     out = add_market_context_columns(out, inplace=True)
-    out = add_risk_intra_columns(out, inplace=True)
     out = add_time_columns(out, inplace=True)
     return out
 

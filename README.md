@@ -1,6 +1,6 @@
 # librarycolumn
 
-Portable, reusable, single-file OHLCV feature library for backtesting.
+Portable, reusable, single-file OHLCV entry-feature library for backtesting.
 
 Install once, import anywhere:
 
@@ -56,7 +56,6 @@ df_some = add_volume_vwap_columns(df_some, inplace=True)
 - `add_gaps_columns(df, inplace=False)`
 - `add_key_levels_columns(df, inplace=False)`
 - `add_market_context_columns(df, inplace=False)`
-- `add_risk_intra_columns(df, inplace=False)`
 - `add_time_columns(df, inplace=False)`
 - `get_all_column_names()`
 - `get_column_groups()`
