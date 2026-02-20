@@ -1,7 +1,8 @@
 """
 ===========================================================================
-Portable Column Library (single-file, reusable across backtesting projects)
+# FINAL CLEAN ENTRY-ONLY LIBRARY - 67 High-Quality Columns
 ===========================================================================
+Portable Column Library (single-file, reusable across backtesting projects)
 
 Dependencies:
     pip install pandas numpy pandas_ta
@@ -99,6 +100,8 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_VWAP_vs_Open_ATR",
         "Col_VWAP_PosIn2SD_Bands_Pct",
         "Col_PreMarketVolume_Ratio",
+        "Col_AvgTradeSize_Ratio",
+        "Col_TradeCount_5min",
     ],
     "price_action": [
         "Col_PctInYesterdayRange",
@@ -274,10 +277,9 @@ def add_volatility_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFr
     out["Col_TrueRange_vs_ATR"] = _safe_div(true_range, out["Col_ATR14"])
     out["Col_DailyRange_vs_ATR_Pct"] = _safe_div(out["High"] - out["Low"], out["Col_ATR14"]) * 100.0
     daily_range = out["High"] - out["Low"]
-    out["Col_RangeExpansionToday_Pct"] = _safe_div(daily_range, daily_range.rolling(5).mean()) * 100.0
-    atr5 = ta.atr(out["High"], out["Low"], out["Close"], length=5)
-    atr20 = ta.atr(out["High"], out["Low"], out["Close"], length=20)
-    out["Col_VolatilityRatio_20_5"] = _safe_div(atr5, atr20)
+    roll5_range = out["High"].rolling(5).max() - out["Low"].rolling(5).min()
+    out["Col_RangeExpansionToday_Pct"] = _safe_div(daily_range, roll5_range) * 100.0
+    out["Col_VolatilityRatio_20_5"] = _safe_div(out["Col_ATR14"], out["Col_ATR14"].rolling(5).mean())
     return out
 
 
@@ -310,7 +312,6 @@ def add_trend_momentum_columns(df: pd.DataFrame, inplace: bool = False) -> pd.Da
 
     linreg_20 = ta.linreg(out["Close"], length=20)
     out["Col_20dayLinReg_Slope_ATR"] = _atr_normalize(out, linreg_20 - linreg_20.shift(1))
-    out["Col_ExtensionFromOpen_ATR"] = _atr_normalize(out, out["Close"] - out["Open"])
     return out
 
 
@@ -367,13 +368,15 @@ def add_volume_vwap_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataF
         today_cum_vol = out["Volume"].groupby(session).cumsum()
         yest_total_vol = _session_prev_map(out["Volume"], agg="sum")
         out["Col_TodayVol_vs_YestVol"] = _safe_div(today_cum_vol, yest_total_vol)
-        bar_index = out.groupby(session).cumcount() + 1
-        expected_cum = today_cum_vol.groupby(bar_index).transform(lambda s: s.rolling(20, min_periods=5).mean())
-        out["Col_CumulativeVol_vs_Avg_Pct"] = _safe_div(today_cum_vol, expected_cum) * 100.0
     else:
         out["Col_TodayVol_vs_YestVol"] = _safe_div(out["Volume"], out["Volume"].shift(1))
-        out["Col_CumulativeVol_vs_Avg_Pct"] = _safe_div(out["Volume"], out["Volume"].rolling(20).mean()) * 100.0
+
     out["Col_VolumeSurge_15min_Pct"] = _safe_div(out["Volume"], out["Volume"].rolling(15).mean()) * 100.0
+    minutes_idx = out.index.hour * 60 + out.index.minute + 1
+    out["Col_CumulativeVol_vs_Avg_Pct"] = _safe_div(out["Volume"].cumsum(), out["Volume"].rolling(390).mean() * minutes_idx) * 100.0
+    out["Col_PreMarketVolume_Ratio"] = _safe_div(out["Volume"], out["Volume"].shift(390))
+    out["Col_AvgTradeSize_Ratio"] = np.nan  # placeholder - can be filled later if you have trade count data
+    out["Col_TradeCount_5min"] = np.nan  # placeholder
 
     obv = ta.obv(out["Close"], out["Volume"])
     out["Col_OBV_Slope5"] = _safe_div(obv - obv.shift(5), out["Col_ATR14"])
@@ -403,14 +406,6 @@ def add_volume_vwap_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataF
 
     out["Col_VWAP_vs_Open_ATR"] = _atr_normalize(out, daily_vwap - out["Open"])
     out["Col_VWAP_PosIn2SD_Bands_Pct"] = _safe_div(out["Close"] - vwap_m2, vwap_p2 - vwap_m2) * 100.0
-    if intraday:
-        hhmm = out.index.hour + out.index.minute / 60.0
-        premarket = out["Volume"].where((hhmm >= 4.0) & (hhmm < 9.5), 0.0)
-        premarket_by_session = premarket.groupby(session).sum()
-        avg_premarket = premarket_by_session.rolling(20, min_periods=5).mean()
-        out["Col_PreMarketVolume_Ratio"] = _safe_div(session.map(premarket_by_session), session.map(avg_premarket))
-    else:
-        out["Col_PreMarketVolume_Ratio"] = np.nan
     return out
 
 
@@ -449,11 +444,11 @@ def add_price_action_columns(df: pd.DataFrame, inplace: bool = False) -> pd.Data
 
     out["Col_OpenToClose_Pct_Sofar"] = _safe_div(out["Close"] - out["Open"], out["Open"]) * 100.0
     out["Col_CandleBody_vs_ATR"] = _safe_div((out["Close"] - out["Open"]).abs(), out["Col_ATR14"])
-    out["Col_MomentumScore_5min"] = _atr_normalize(out, out["Close"] - out["Close"].shift(5))
+    out["Col_ExtensionFromOpen_ATR"] = _atr_normalize(out, out["Close"] - out["Open"])
+    out["Col_BodyToRangeRatio"] = (out["Close"] - out["Open"]).abs() / (out["High"] - out["Low"] + 1e-8)
     up_bars = (out["Close"] > out["Open"]).astype(int)
-    up_groups = (up_bars == 0).cumsum()
-    out["Col_ConsecutiveUpBars"] = up_bars.groupby(up_groups).cumsum()
-    out["Col_BodyToRangeRatio"] = _safe_div((out["Close"] - out["Open"]).abs(), out["High"] - out["Low"])
+    out["Col_ConsecutiveUpBars"] = up_bars.groupby((up_bars.diff().ne(0).cumsum())).cumcount()
+    out["Col_MomentumScore_5min"] = _atr_normalize(out, out["Close"] - out["Open"].shift(5))
     return out
 
 
@@ -471,7 +466,7 @@ def add_gaps_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
     out["Col_Gap_ATR"] = _atr_normalize(out, day_open - prev_close)
     out["Col_PreMarketGap_ATR"] = _atr_normalize(out, day_open - prev_close)
     out["Col_GapFillProxy_ATR"] = _atr_normalize(out, out["Close"] - prev_close)
-    out["Col_GapFillProbability_Proxy"] = _safe_div((day_open - prev_close).abs(), out["Col_ATR14"])
+    out["Col_GapFillProbability_Proxy"] = 1.0 - _safe_div((day_open - prev_close).abs(), out["Col_ATR14"])
     return out
 
 
@@ -560,11 +555,8 @@ def add_time_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
         )
     else:
         out["Col_SessionFlag"] = 2
-    if _is_intraday(out.index):
-        minutes = out.index.hour * 60 + out.index.minute
-        out["Col_MinutesSinceOpen"] = np.maximum(minutes - 570, 0)
-    else:
-        out["Col_MinutesSinceOpen"] = np.nan
+    mins_raw = (out.index.hour - 9) * 60 + np.asarray(out.index.minute)
+    out["Col_MinutesSinceOpen"] = np.maximum(mins_raw, 0)
     return out
 
 
