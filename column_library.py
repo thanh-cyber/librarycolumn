@@ -11,6 +11,7 @@ Usage example:
     import pandas as pd
     from column_library import (
         add_all_columns,
+        add_all_missing_indicators,
         add_volatility_columns,
         add_volume_vwap_columns,
         get_all_column_names,
@@ -587,4 +588,247 @@ def get_all_column_names() -> List[str]:
 
 def get_column_groups() -> Dict[str, List[str]]:
     return {k: v.copy() for k, v in _COLUMN_GROUPS.items()}
+
+
+# ====================== 78 MISSING INDICATORS (TA-Lib non-CDL + Backtrader uniques) ======================
+def _pick_ohlcv_columns(df: pd.DataFrame) -> tuple:
+    """Return (open, high, low, close, volume) column names. Accepts both long and single-ticker formats."""
+    o = "open" if "open" in df.columns else ("Open" if "Open" in df.columns else None)
+    h = "high" if "high" in df.columns else ("High" if "High" in df.columns else None)
+    l = "low" if "low" in df.columns else ("Low" if "Low" in df.columns else None)
+    c = "close" if "close" in df.columns else ("Close" if "Close" in df.columns else None)
+    v = "volume" if "volume" in df.columns else ("Volume" if "Volume" in df.columns else None)
+    return o, h, l, c, v
+
+
+def _pick_indicator_col(ind_df: Optional[pd.DataFrame], index: pd.Index, prefixes: List[str]) -> pd.Series:
+    """Extract first matching column from pandas_ta output by prefix."""
+    if ind_df is None or ind_df.empty:
+        return pd.Series(np.nan, index=index, dtype=float)
+    for col in ind_df.columns:
+        c = str(col)
+        if any(c.startswith(p) for p in prefixes):
+            s = ind_df[col].reindex(index)
+            return s.astype(float)
+    return pd.Series(np.nan, index=index, dtype=float)
+
+
+def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add 78 TA-Lib non-CDL and Backtrader-unique indicators via pandas_ta.
+
+    Works on long-format minute-bar DataFrames with columns: Ticker, datetime,
+    open, high, low, close, volume. Also supports single-ticker with DatetimeIndex
+    and capitalized Open, High, Low, Close, Volume.
+    """
+    df = df.copy()
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(df)
+    if not all([o_col, h_col, l_col, c_col]):
+        raise ValueError("DataFrame must have open/high/low/close (or Open/High/Low/Close)")
+
+    has_ticker = "Ticker" in df.columns
+    has_datetime_col = "datetime" in df.columns
+
+    if has_ticker:
+        sort_cols = ["Ticker"]
+        if has_datetime_col:
+            sort_cols.append("datetime")
+            if not pd.api.types.is_datetime64_any_dtype(df["datetime"]):
+                df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+    elif isinstance(df.index, pd.DatetimeIndex):
+        df = df.sort_index()
+
+    def _add_indicators_to_group(g: pd.DataFrame) -> pd.DataFrame:
+        ohlc = g[[o_col, h_col, l_col, c_col]].copy()
+        ohlc.columns = ["open", "high", "low", "close"]
+        if v_col and v_col in g.columns:
+            ohlc["volume"] = g[v_col]
+        idx = g.index
+
+        def _col(prefixes: List[str], ind_df: Optional[pd.DataFrame]) -> pd.Series:
+            return _pick_indicator_col(ind_df, idx, prefixes)
+
+        # === Overlap / MAs ===
+        g["Col_DEMA20"] = ta.dema(ohlc["close"], length=20)
+        g["Col_TEMA20"] = ta.tema(ohlc["close"], length=20)
+        g["Col_KAMA20"] = ta.kama(ohlc["close"], length=20)
+        mama_df = ta.mama(ohlc["close"])
+        g["Col_MAMA"] = _col(["MAMA"], mama_df)
+        g["Col_FAMA"] = _col(["FAMA"], mama_df)
+        g["Col_TRIMA20"] = ta.trima(ohlc["close"], length=20)
+        g["Col_WMA20"] = ta.wma(ohlc["close"], length=20)
+
+        # === Volatility / SAR ===
+        psar_df = ta.psar(ohlc["high"], ohlc["low"], ohlc["close"])
+        if psar_df is not None:
+            psar_long = _col(["PSARl"], psar_df)
+            psar_short = _col(["PSARs"], psar_df)
+            g["Col_SAR"] = psar_long.fillna(psar_short)
+        else:
+            g["Col_SAR"] = np.nan
+        psar_ext = ta.psar(ohlc["high"], ohlc["low"], ohlc["close"], af0=0.01, max_af=0.25)
+        if psar_ext is not None:
+            pe_long = _col(["PSARl"], psar_ext)
+            pe_short = _col(["PSARs"], psar_ext)
+            g["Col_SAREXT"] = pe_long.fillna(pe_short)
+        else:
+            g["Col_SAREXT"] = np.nan
+        natr_ser = ta.natr(ohlc["high"], ohlc["low"], ohlc["close"], length=14)
+        g["Col_NATR14"] = natr_ser if natr_ser is not None else pd.Series(np.nan, index=idx)
+
+        # === Momentum / Oscillators ===
+        adx_df = ta.adx(ohlc["high"], ohlc["low"], ohlc["close"], length=14)
+        g["Col_ADXR14"] = _col(["ADXR"], adx_df)
+        dmp = _col(["DMP"], adx_df)
+        dmn = _col(["DMN"], adx_df)
+        denom = dmp + dmn
+        g["Col_DX14"] = np.where(denom > 0, 100 * (dmp - dmn).abs() / denom, np.nan)
+        atr14 = ta.atr(ohlc["high"], ohlc["low"], ohlc["close"], length=14)
+        atr_safe = atr14.replace(0, np.nan) if atr14 is not None else pd.Series(np.nan, index=g.index)
+        g["Col_PLUS_DI14"] = 100 * dmp / atr_safe if atr14 is not None else np.nan
+        g["Col_MINUS_DI14"] = 100 * dmn / atr_safe if atr14 is not None else np.nan
+        g["Col_APO"] = ta.apo(ohlc["close"], fast=12, slow=26)
+        aroon_df = ta.aroon(ohlc["high"], ohlc["low"], length=14)
+        g["Col_AROON_UP"] = _col(["AROONU"], aroon_df)
+        g["Col_AROON_DOWN"] = _col(["AROOND"], aroon_df)
+        g["Col_AROONOSC"] = _col(["AROONOSC"], aroon_df)
+        g["Col_BOP"] = ta.bop(ohlc["open"], ohlc["high"], ohlc["low"], ohlc["close"])
+        g["Col_CMO14"] = ta.cmo(ohlc["close"], length=14)
+        if v_col and "volume" in ohlc.columns:
+            g["Col_MFI14"] = ta.mfi(ohlc["high"], ohlc["low"], ohlc["close"], ohlc["volume"], length=14)
+        else:
+            g["Col_MFI14"] = np.nan
+        g["Col_MINUS_DM14"] = dmn
+        g["Col_MOM10"] = ta.mom(ohlc["close"], length=10)
+        g["Col_PLUS_DM14"] = dmp
+        ppo_df = ta.ppo(ohlc["close"], fast=12, slow=26)
+        g["Col_PPO"] = _col(["PPO_"], ppo_df) if ppo_df is not None else np.nan
+        g["Col_ROCP10"] = ta.roc(ohlc["close"], length=10)
+        shifted = ohlc["close"].shift(10)
+        g["Col_ROCR10"] = _safe_div(ohlc["close"], shifted)
+        g["Col_ROCR10010"] = 100 * _safe_div(ohlc["close"], shifted)
+        stochf_df = ta.stochf(ohlc["high"], ohlc["low"], ohlc["close"], k=5, d=3)
+        g["Col_STOCHF_K"] = _col(["STOCHFk"], stochf_df)
+        g["Col_STOCHF_D"] = _col(["STOCHFd"], stochf_df)
+        stochrsi_df = ta.stochrsi(ohlc["close"], length=14)
+        g["Col_STOCHRSI_K"] = _col(["STOCHRSIk"], stochrsi_df)
+        g["Col_STOCHRSI_D"] = _col(["STOCHRSId"], stochrsi_df)
+        trix_df = ta.trix(ohlc["close"], length=15)
+        g["Col_TRIX15"] = _col(["TRIX"], trix_df) if trix_df is not None else np.nan
+        ultosc_ser = ta.uo(ohlc["high"], ohlc["low"], ohlc["close"])
+        g["Col_ULTOSC"] = ultosc_ser if ultosc_ser is not None else np.nan
+        g["Col_WILLR14"] = ta.willr(ohlc["high"], ohlc["low"], ohlc["close"], length=14)
+
+        # === Price transforms ===
+        g["Col_AVGPRICE"] = ta.ohlc4(ohlc["open"], ohlc["high"], ohlc["low"], ohlc["close"])
+        g["Col_MEDPRICE"] = (ohlc["high"] + ohlc["low"]) / 2
+        g["Col_TYPPRICE"] = ta.hlc3(ohlc["high"], ohlc["low"], ohlc["close"])
+        g["Col_WCLPRICE"] = (ohlc["high"] + ohlc["low"] + 2 * ohlc["close"]) / 4
+
+        # === Hilbert Transform (pandas_ta has ht_trendline; others from TA-Lib if available) ===
+        try:
+            g["Col_HT_TRENDLINE"] = ta.ht_trendline(ohlc["close"])
+        except Exception:
+            g["Col_HT_TRENDLINE"] = np.nan
+        for col, fn, args in [
+            ("Col_HT_DCPERIOD", "ht_dcperiod", ()),
+            ("Col_HT_DCPHASE", "ht_dcphase", ()),
+            ("Col_HT_TRENDMODE", "ht_trendmode", ()),
+        ]:
+            fn_obj = getattr(ta, fn, None)
+            if fn_obj is not None:
+                try:
+                    r = fn_obj(ohlc["close"], *args)
+                    g[col] = r if r is not None else np.nan
+                except Exception:
+                    g[col] = np.nan
+            else:
+                g[col] = np.nan
+        phasor_fn = getattr(ta, "ht_phasor", None)
+        if phasor_fn is not None:
+            try:
+                phasor_df = phasor_fn(ohlc["close"])
+                g["Col_HT_PHASOR_INPHASE"] = _col(["INPHASE"], phasor_df)
+                g["Col_HT_PHASOR_QUADRATURE"] = _col(["QUADRATURE"], phasor_df)
+            except Exception:
+                g["Col_HT_PHASOR_INPHASE"] = g["Col_HT_PHASOR_QUADRATURE"] = np.nan
+        else:
+            g["Col_HT_PHASOR_INPHASE"] = g["Col_HT_PHASOR_QUADRATURE"] = np.nan
+        sine_fn = getattr(ta, "ht_sine", None)
+        if sine_fn is not None:
+            try:
+                sine_df = sine_fn(ohlc["close"])
+                g["Col_HT_SINE_SINE"] = _col(["SINE"], sine_df)
+                g["Col_HT_SINE_LEADSINE"] = _col(["LEADSINE"], sine_df)
+            except Exception:
+                g["Col_HT_SINE_SINE"] = g["Col_HT_SINE_LEADSINE"] = np.nan
+        else:
+            g["Col_HT_SINE_SINE"] = g["Col_HT_SINE_LEADSINE"] = np.nan
+
+        # === Linear Regression ===
+        g["Col_LINEARREG20"] = ta.linreg(ohlc["close"], length=20)
+        lra = ta.linreg(ohlc["close"], length=20, angle=True)
+        g["Col_LINEARREG_ANGLE20"] = lra if lra is not None else np.nan
+        lri = ta.linreg(ohlc["close"], length=20, intercept=True)
+        g["Col_LINEARREG_INTERCEPT20"] = lri if lri is not None else np.nan
+        lrs = ta.linreg(ohlc["close"], length=20, slope=True)
+        g["Col_LINEARREG_SLOPE20"] = lrs if lrs is not None else np.nan
+        g["Col_STDDEV20"] = ta.stdev(ohlc["close"], length=20)
+        g["Col_VAR20"] = ta.variance(ohlc["close"], length=20)
+
+        # === Hull / Heikin Ashi / Ichimoku ===
+        g["Col_HullMA20"] = ta.hma(ohlc["close"], length=20)
+        ha_df = ta.ha(ohlc["open"], ohlc["high"], ohlc["low"], ohlc["close"])
+        g["Col_HeikinAshi_Open"] = _col(["HA_open"], ha_df)
+        g["Col_HeikinAshi_High"] = _col(["HA_high"], ha_df)
+        g["Col_HeikinAshi_Low"] = _col(["HA_low"], ha_df)
+        g["Col_HeikinAshi_Close"] = _col(["HA_close"], ha_df)
+
+        ichi_result = ta.ichimoku(ohlc["high"], ohlc["low"], ohlc["close"], include_chikou=True, lookahead=False)
+        if ichi_result and ichi_result[0] is not None:
+            main_ichi = ichi_result[0]
+            g["Col_Ichimoku_Tenkan"] = _col(["ITS"], main_ichi)
+            g["Col_Ichimoku_Kijun"] = _col(["IKS"], main_ichi)
+            g["Col_Ichimoku_SenkouA"] = _col(["ISA"], main_ichi)
+            g["Col_Ichimoku_SenkouB"] = _col(["ISB"], main_ichi)
+            g["Col_Ichimoku_Chikou"] = _col(["ICS"], main_ichi)
+        else:
+            for col in ["Col_Ichimoku_Tenkan", "Col_Ichimoku_Kijun", "Col_Ichimoku_SenkouA", "Col_Ichimoku_SenkouB", "Col_Ichimoku_Chikou"]:
+                g[col] = np.nan
+
+        g["Col_PivotPoint"] = (ohlc["high"] + ohlc["low"] + ohlc["close"]) / 3
+
+        ao_ser = ta.ao(ohlc["high"], ohlc["low"])
+        g["Col_AwesomeOscillator"] = ao_ser if ao_ser is not None else np.nan
+        if ao_ser is not None:
+            ao_sma = ta.sma(ao_ser, length=5)
+            g["Col_AccelerationDeceleration"] = ao_ser - ao_sma if ao_sma is not None else ao_ser
+        else:
+            g["Col_AccelerationDeceleration"] = np.nan
+
+        g["Col_DPO"] = ta.dpo(ohlc["close"], length=20)
+        kst_df = ta.kst(ohlc["close"])
+        g["Col_KST"] = _col(["KST_"], kst_df) if kst_df is not None else np.nan
+
+        g["Col_PercentRank20"] = ohlc["close"].rolling(20).rank(pct=True) * 100
+
+        vortex_df = ta.vortex(ohlc["high"], ohlc["low"], ohlc["close"], length=14)
+        g["Col_Vortex_Plus"] = _col(["VTXP"], vortex_df)
+        g["Col_Vortex_Minus"] = _col(["VTXM"], vortex_df)
+
+        return g
+
+    if has_ticker:
+        group_col = "Ticker"
+        pieces = []
+        for name, grp in df.groupby(group_col, group_keys=False):
+            out = _add_indicators_to_group(grp.drop(columns=[group_col]))
+            out[group_col] = name
+            pieces.append(out)
+        df = pd.concat(pieces, ignore_index=True)
+    else:
+        df = _add_indicators_to_group(df)
+
+    return df.reset_index(drop=True) if has_ticker else df
 
