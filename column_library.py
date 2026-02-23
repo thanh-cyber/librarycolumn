@@ -14,10 +14,13 @@ Usage example:
         add_all_missing_indicators,
         add_final_22_missing_columns,
         add_cruncher_context_columns,
+        add_continuous_tracking,
+        get_minute_by_minute_tracking,
         add_volatility_columns,
         add_volume_vwap_columns,
         get_all_column_names,
         get_column_groups,
+        CONTINUOUS_TRACKING_COLUMNS,
     )
 
     # 1) Add everything (all categories)
@@ -1108,4 +1111,162 @@ def add_cruncher_context_columns(df: pd.DataFrame) -> pd.DataFrame:
         df = _add_cruncher_to_group(df)
 
     return df.reset_index(drop=True) if has_ticker else df
+
+
+# ====================== CONTINUOUS INTRATRADE TRACKING ======================
+# Columns to track every minute while position is open (Entry / Exit / Max / Min / At30min / At60min)
+CONTINUOUS_TRACKING_COLUMNS: List[str] = [
+    "Col_ExtensionFromDaily9EMA_ATR",
+    "Col_VWAP_Deviation_ATR",
+    "Col_RSI14",
+    "Col_StochK_14_3",
+    "Col_MACD_Hist",
+    "Col_BollingerPctB",
+    "Col_ORB_15min_DistHigh_ATR",
+    "Col_StdDev_Last10Bars_ATR",
+    "Col_CCI20",
+    "Col_VolumeSurge_1min_Ratio",
+    "Col_IntradayATR_Ratio",
+    "Col_ChoppinessIndex_14",
+    "Col_SuperTrend",
+    "Col_Keltner_Upper",
+    "Col_Keltner_Lower",
+    "Col_RelativeVigorIndex",
+    "Col_SchaffTrendCycle",
+]
+
+
+def add_continuous_tracking(
+    df_enriched: pd.DataFrame,
+    trades: pd.DataFrame,
+    *,
+    entry_time_col: str = "EntryTime",
+    exit_time_col: str = "ExitTime",
+    ticker_col: str = "Ticker",
+    datetime_col: str = "datetime",
+    columns: Optional[List[str]] = None,
+    at_minutes: Optional[List[int]] = None,
+) -> pd.DataFrame:
+    """
+    Add continuous intra-trade tracking for selected Col_* columns.
+
+    For each column we add: _Entry, _Exit, _Max, _Min, and _At{N}min for each N in at_minutes.
+    df_enriched must have Ticker and datetime (or your names via ticker_col/datetime_col)
+    and the Col_* columns. trades must have ticker, entry time, and exit time.
+
+    Usage:
+        df = add_all_missing_indicators(df)
+        df = add_cruncher_context_columns(df)
+        result.trades = add_continuous_tracking(df, result.trades)
+    """
+    trades = trades.copy()
+    if columns is None:
+        columns = CONTINUOUS_TRACKING_COLUMNS
+    if at_minutes is None:
+        at_minutes = [30, 60]
+
+    # Work with columns; reset MultiIndex so we have Ticker and datetime as columns
+    df_work = df_enriched.reset_index() if isinstance(df_enriched.index, pd.MultiIndex) else df_enriched.copy()
+    if ticker_col not in df_work.columns or datetime_col not in df_work.columns:
+        raise ValueError(f"df_enriched must have {ticker_col} and {datetime_col} (or reset MultiIndex)")
+
+    for col in columns:
+        if col not in df_work.columns:
+            continue
+        # Entry / Exit lookup: (ticker, time) -> value (last wins if duplicate keys)
+        keys = list(zip(df_work[ticker_col], pd.to_datetime(df_work[datetime_col])))
+        col_dict = dict(zip(keys, df_work[col].values))
+
+        entry_keys = list(zip(trades[ticker_col], pd.to_datetime(trades[entry_time_col])))
+        exit_keys = list(zip(trades[ticker_col], pd.to_datetime(trades[exit_time_col])))
+
+        trades[f"{col}_Entry"] = [col_dict.get(k, np.nan) for k in entry_keys]
+        trades[f"{col}_Exit"] = [col_dict.get(k, np.nan) for k in exit_keys]
+
+        # Max / Min over [entry, exit] per trade
+        def _max_min(row: pd.Series, agg: str) -> float:
+            t = row[ticker_col]
+            entry_ts = pd.Timestamp(row[entry_time_col])
+            exit_ts = pd.Timestamp(row[exit_time_col])
+            mask = (
+                (df_work[ticker_col] == t)
+                & (pd.to_datetime(df_work[datetime_col]) >= entry_ts)
+                & (pd.to_datetime(df_work[datetime_col]) <= exit_ts)
+            )
+            if not mask.any():
+                return np.nan
+            s = df_work.loc[mask, col]
+            return s.max() if agg == "max" else s.min()
+
+        trades[f"{col}_Max"] = trades.apply(lambda row: _max_min(row, "max"), axis=1)
+        trades[f"{col}_Min"] = trades.apply(lambda row: _max_min(row, "min"), axis=1)
+
+        for minutes in at_minutes:
+            target = pd.to_datetime(trades[entry_time_col]) + pd.Timedelta(minutes=minutes)
+            at_keys = list(zip(trades[ticker_col], target))
+            trades[f"{col}_At{minutes}min"] = [col_dict.get(k, np.nan) for k in at_keys]
+
+    return trades
+
+
+def get_minute_by_minute_tracking(
+    df_enriched: pd.DataFrame,
+    trades: pd.DataFrame,
+    *,
+    entry_time_col: str = "EntryTime",
+    exit_time_col: str = "ExitTime",
+    ticker_col: str = "Ticker",
+    datetime_col: str = "datetime",
+    columns: Optional[List[str]] = None,
+    trade_id_col: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Return minute-by-minute tracking for selected Col_* columns through each trade.
+
+    Output: one row per (trade, minute bar) with datetime, minute_offset from entry,
+    and the value of each tracked column at that minute. Use for exit discovery,
+    plotting evolution, or ML features.
+
+    Usage:
+        df = add_all_missing_indicators(df)
+        df = add_cruncher_context_columns(df)
+        mbm = get_minute_by_minute_tracking(df, result.trades)
+    """
+    if columns is None:
+        columns = [c for c in CONTINUOUS_TRACKING_COLUMNS if c in df_enriched.columns]
+
+    df_work = df_enriched.reset_index() if isinstance(df_enriched.index, pd.MultiIndex) else df_enriched.copy()
+    if ticker_col not in df_work.columns or datetime_col not in df_work.columns:
+        raise ValueError(f"df_enriched must have {ticker_col} and {datetime_col} (or reset MultiIndex)")
+
+    dt_series = pd.to_datetime(df_work[datetime_col])
+    rows = []
+
+    for trade_idx, row in trades.iterrows():
+        t = row[ticker_col]
+        entry_ts = pd.Timestamp(row[entry_time_col])
+        exit_ts = pd.Timestamp(row[exit_time_col])
+        mask = (
+            (df_work[ticker_col] == t)
+            & (dt_series >= entry_ts)
+            & (dt_series <= exit_ts)
+        )
+        if not mask.any():
+            continue
+        slice_df = df_work.loc[mask].copy()
+        slice_df = slice_df.sort_values(datetime_col)
+        slice_df["minute_offset"] = (pd.to_datetime(slice_df[datetime_col]) - entry_ts).dt.total_seconds() / 60
+        slice_df["trade_idx"] = trade_idx
+        if trade_id_col and trade_id_col in trades.columns:
+            slice_df["trade_id"] = row[trade_id_col]
+        rows.append(slice_df)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[ticker_col, datetime_col, "trade_idx", "minute_offset"]
+            + [c for c in columns if c in df_work.columns]
+        )
+
+    out = pd.concat(rows, ignore_index=True)
+    return out
 
