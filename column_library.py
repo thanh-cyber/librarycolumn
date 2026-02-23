@@ -1,6 +1,6 @@
 """
 ===========================================================================
-# FINAL CLEAN ENTRY-ONLY LIBRARY - 67 High-Quality Columns
+# ENTRY-ONLY COLUMN LIBRARY — 67 core + 103 indicators + 28 cruncher (optional)
 ===========================================================================
 Portable Column Library (single-file, reusable across backtesting projects)
 
@@ -169,7 +169,6 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_SchaffTrendCycle",
     ],
     "cruncher_context": [
-        "Col_Gap_Pct",
         "Col_GapFill_15min_Pct",
         "Col_GapFill_15min_Zscore",
         "Col_ORB_5min_BreakHigh",
