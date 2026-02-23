@@ -1,6 +1,6 @@
 """
 ===========================================================================
-# ENTRY-ONLY COLUMN LIBRARY — 67 core + 103 indicators + 25 cruncher (optional)
+# ENTRY-ONLY COLUMN LIBRARY — ~216 columns (67 core + 103 indicators + 25 cruncher + 18 advanced cruncher)
 ===========================================================================
 Portable Column Library (single-file, reusable across backtesting projects)
 
@@ -11,9 +11,11 @@ Usage example:
     import pandas as pd
     from column_library import (
         add_all_columns,
+        add_full_enrichment,
         add_all_missing_indicators,
         add_final_22_missing_columns,
         add_cruncher_context_columns,
+        add_advanced_cruncher_columns,
         add_continuous_tracking,
         get_minute_by_minute_tracking,
         add_volatility_columns,
@@ -40,8 +42,8 @@ Usage example:
     print(entry_features.head(10))
 
 Data assumptions:
-    - Required columns: 'Open', 'High', 'Low', 'Close', 'Volume'
-    - Index: sorted pandas.DatetimeIndex (daily or intraday)
+    - Single-ticker: DatetimeIndex, columns Open/High/Low/Close/Volume
+    - Long format: columns Ticker, datetime, open/high/low/close/volume (lowercase)
     - All calculations are vectorized and avoid lookahead.
 """
 
@@ -202,6 +204,26 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_GapPct_x_RelVol30",
         "Col_GapPct_x_ExtensionATR",
     ],
+    "advanced_cruncher": [
+        "Col_Gap_Pct_Rank_Day",
+        "Col_RelativeVolume_First30min_Rank_Day",
+        "Col_DollarVolume_Rank_Day",
+        "Col_ExtensionFromDaily9EMA_Rank_Day",
+        "Col_PreMarketStrength_Pct",
+        "Col_First15minReturn_Pct",
+        "Col_FirstHourReturn_Pct",
+        "Col_LastHourReturn_Pct",
+        "Col_LunchHourPerformance_Pct",
+        "Col_VolatilityContraction_5d",
+        "Col_ATR_Expansion_Streak",
+        "Col_VolatilityRegime",
+        "Col_AboveWeekly20MA",
+        "Col_PctInMonthlyRange",
+        "Col_GapPct_x_RelVolRank_Day",
+        "Col_ExtensionATR_x_VolContraction",
+        "Col_DistFrom5DayMean_ATR",
+        "Col_ConsecutiveGapDays",
+    ],
 }
 
 
@@ -231,6 +253,16 @@ def _copy_if_needed(df: pd.DataFrame, inplace: bool) -> pd.DataFrame:
     return df if inplace else df.copy()
 
 
+def _pick_ohlcv_columns(df: pd.DataFrame) -> tuple:
+    """Return (open, high, low, close, volume) column names. Accepts both long and single-ticker formats."""
+    o = "open" if "open" in df.columns else ("Open" if "Open" in df.columns else None)
+    h = "high" if "high" in df.columns else ("High" if "High" in df.columns else None)
+    l = "low" if "low" in df.columns else ("Low" if "Low" in df.columns else None)
+    c = "close" if "close" in df.columns else ("Close" if "Close" in df.columns else None)
+    v = "volume" if "volume" in df.columns else ("Volume" if "Volume" in df.columns else None)
+    return o, h, l, c, v
+
+
 def _session_labels(idx: pd.DatetimeIndex) -> pd.Series:
     return pd.Series(idx.normalize(), index=idx)
 
@@ -241,8 +273,27 @@ def _is_intraday(idx: pd.DatetimeIndex) -> bool:
     return idx.normalize().duplicated().any()
 
 
-def _session_prev_map(series: pd.Series, agg: str) -> pd.Series:
-    session = _session_labels(series.index)
+def _session_labels_for_group(g: pd.DataFrame) -> pd.Series:
+    """Return session (date) Series for group g. Works with DatetimeIndex or datetime column."""
+    if "datetime" in g.columns:
+        time = pd.to_datetime(g["datetime"])
+        return pd.Series(time.dt.normalize().values, index=g.index)
+    return _session_labels(g.index)
+
+
+def _is_intraday_for_group(g: pd.DataFrame) -> bool:
+    """Return True if group has multiple bars per session. Works with DatetimeIndex or datetime column."""
+    if len(g) < 2:
+        return False
+    if "datetime" in g.columns:
+        time = pd.to_datetime(g["datetime"])
+        return time.dt.normalize().duplicated().any()
+    return _is_intraday(g.index)
+
+
+def _session_prev_map(series: pd.Series, agg: str, session: Optional[pd.Series] = None) -> pd.Series:
+    if session is None:
+        session = _session_labels(series.index)
     grouped = series.groupby(session)
     if agg == "first":
         daily = grouped.first()
@@ -316,6 +367,23 @@ def _session_weighted_vwap_std(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     return vwap, std
 
 
+def _session_weighted_vwap_std_flex(
+    h: pd.Series, l: pd.Series, c: pd.Series, v: pd.Series, session: pd.Series
+) -> tuple[pd.Series, pd.Series]:
+    """VWAP and std using session. Works with any index."""
+    typical = (h + l + c) / 3.0
+    pv = typical * v
+    pv2 = (typical**2) * v
+    cum_v = v.groupby(session).cumsum()
+    cum_pv = pv.groupby(session).cumsum()
+    cum_pv2 = pv2.groupby(session).cumsum()
+    vwap = _safe_div(cum_pv, cum_v)
+    variance = _safe_div(cum_pv2, cum_v) - (vwap**2)
+    variance = variance.clip(lower=0)
+    std = np.sqrt(variance)
+    return vwap, std
+
+
 def _bars_since_event(event: pd.Series) -> pd.Series:
     event = event.fillna(False).astype(bool)
     group_id = event.cumsum()
@@ -325,309 +393,569 @@ def _bars_since_event(event: pd.Series) -> pd.Series:
 
 
 # ====================== VOLATILITY & NORMALIZATION ======================
+def _add_volatility_to_group(
+    g: pd.DataFrame, o_col: str, h_col: str, l_col: str, c_col: str, v_col: Optional[str]
+) -> pd.DataFrame:
+    """Add volatility columns to one ticker's group. Works with DatetimeIndex or datetime column."""
+    h, l_, c = g[h_col], g[l_col], g[c_col]
+    g = g.copy()
+    g["Col_ATR14"] = ta.atr(h, l_, c, length=14)
+    g["Col_NormalizedATR_Pct"] = _safe_div(g["Col_ATR14"], c) * 100.0
+    g["Col_ATR_vs_20dayAvg_Pct"] = _safe_div(g["Col_ATR14"], g["Col_ATR14"].rolling(20).mean()) * 100.0
+    g["Col_ATR14_vs_5dayAvg_Pct"] = _safe_div(g["Col_ATR14"], g["Col_ATR14"].rolling(5).mean()) * 100.0
+
+    log_ret = np.log(_safe_div(c, c.shift(1)))
+    g["Col_HistoricalVol_20day"] = log_ret.rolling(20).std() * np.sqrt(252.0) * 100.0
+
+    true_range = ta.true_range(h, l_, c)
+    g["Col_TrueRange_vs_ATR"] = _safe_div(true_range, g["Col_ATR14"])
+    g["Col_DailyRange_vs_ATR_Pct"] = _safe_div(h - l_, g["Col_ATR14"]) * 100.0
+    daily_range = h - l_
+    roll5_range = h.rolling(5).max() - l_.rolling(5).min()
+    g["Col_RangeExpansionToday_Pct"] = _safe_div(daily_range, roll5_range) * 100.0
+    g["Col_VolatilityRatio_20_5"] = _safe_div(g["Col_ATR14"], g["Col_ATR14"].rolling(5).mean())
+    return g
+
+
 def add_volatility_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+    """Add 9 volatility columns. Supports long format (Ticker, datetime, o/h/l/c/v) and single-ticker (DatetimeIndex, Open/High/Low/Close/Volume)."""
     out = _copy_if_needed(df, inplace)
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(out)
+    if not all([o_col, h_col, l_col, c_col]):
+        raise ValueError("DataFrame must have open/high/low/close (or Open/High/Low/Close)")
+
+    has_ticker = "Ticker" in out.columns
+    if has_ticker:
+        if "datetime" not in out.columns:
+            raise ValueError("Long format requires 'datetime' column")
+        if not pd.api.types.is_datetime64_any_dtype(out["datetime"]):
+            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        out = out.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
+        pieces = []
+        for name, grp in out.groupby("Ticker", group_keys=False):
+            g = _add_volatility_to_group(grp, o_col, h_col, l_col, c_col, v_col)
+            g["Ticker"] = name
+            pieces.append(g)
+        return pd.concat(pieces, ignore_index=True)
+
     _validate_ohlcv_df(out)
-
-    out["Col_ATR14"] = ta.atr(out["High"], out["Low"], out["Close"], length=14)
-    out["Col_NormalizedATR_Pct"] = _safe_div(out["Col_ATR14"], out["Close"]) * 100.0
-    out["Col_ATR_vs_20dayAvg_Pct"] = _safe_div(out["Col_ATR14"], out["Col_ATR14"].rolling(20).mean()) * 100.0
-    out["Col_ATR14_vs_5dayAvg_Pct"] = _safe_div(out["Col_ATR14"], out["Col_ATR14"].rolling(5).mean()) * 100.0
-
-    log_ret = np.log(_safe_div(out["Close"], out["Close"].shift(1)))
-    out["Col_HistoricalVol_20day"] = log_ret.rolling(20).std() * np.sqrt(252.0) * 100.0
-
-    true_range = ta.true_range(out["High"], out["Low"], out["Close"])
-    out["Col_TrueRange_vs_ATR"] = _safe_div(true_range, out["Col_ATR14"])
-    out["Col_DailyRange_vs_ATR_Pct"] = _safe_div(out["High"] - out["Low"], out["Col_ATR14"]) * 100.0
-    daily_range = out["High"] - out["Low"]
-    roll5_range = out["High"].rolling(5).max() - out["Low"].rolling(5).min()
-    out["Col_RangeExpansionToday_Pct"] = _safe_div(daily_range, roll5_range) * 100.0
-    out["Col_VolatilityRatio_20_5"] = _safe_div(out["Col_ATR14"], out["Col_ATR14"].rolling(5).mean())
-    return out
+    return _add_volatility_to_group(out, "Open", "High", "Low", "Close", "Volume")
 
 
 # ====================== TREND & MOMENTUM ======================
+def _add_trend_momentum_to_group(
+    g: pd.DataFrame, o_col: str, h_col: str, l_col: str, c_col: str, v_col: Optional[str]
+) -> pd.DataFrame:
+    h, l_, c = g[h_col], g[l_col], g[c_col]
+    idx = g.index
+    g = g.copy()
+    if "Col_ATR14" not in g.columns:
+        g = _add_volatility_to_group(g, o_col, h_col, l_col, c_col, v_col)
+
+    sma50 = ta.sma(c, length=50)
+    sma200 = ta.sma(c, length=200)
+    if sma50 is None:
+        sma50 = pd.Series(np.nan, index=idx)
+    if sma200 is None:
+        sma200 = pd.Series(np.nan, index=idx)
+    g["Col_DistTo50MA_ATR"] = _atr_normalize(g, c - sma50)
+    g["Col_DistTo200MA_ATR"] = _atr_normalize(g, c - sma200)
+    g["Col_PriceAbove200MA_ATR"] = _atr_normalize(g, c - sma200)
+
+    adx_df = ta.adx(h, l_, c, length=14)
+    dmp = _indicator_col(adx_df, g.index, exact_names=["DMP_14"], starts_with=["DMP_"])
+    dmn = _indicator_col(adx_df, g.index, exact_names=["DMN_14"], starts_with=["DMN_"])
+    g["Col_ADX14"] = _indicator_col(adx_df, g.index, exact_names=["ADX_14"], starts_with=["ADX_"])
+    g["Col_DI_Diff"] = dmp - dmn
+
+    macd_df = ta.macd(c, fast=12, slow=26, signal=9)
+    macd_hist = _indicator_col(macd_df, g.index, exact_names=["MACDh_12_26_9"], starts_with=["MACDh_"])
+    macd_val = _indicator_col(macd_df, g.index, exact_names=["MACD_12_26_9"], starts_with=["MACD_"])
+    g["Col_MACD_Hist"] = macd_hist
+    g["Col_MACDV_Normalized"] = _safe_div(macd_val, g["Col_ATR14"])
+
+    g["Col_ROC10"] = ta.roc(c, length=10)
+    g["Col_ROC20"] = ta.roc(c, length=20)
+
+    linreg_20 = ta.linreg(c, length=20)
+    if linreg_20 is None:
+        linreg_20 = pd.Series(np.nan, index=idx)
+    g["Col_20dayLinReg_Slope_ATR"] = _atr_normalize(g, linreg_20 - linreg_20.shift(1))
+    return g
+
+
 def add_trend_momentum_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+    """Add trend/momentum columns. Supports long format (Ticker, datetime, o/h/l/c/v) and single-ticker."""
     out = _copy_if_needed(df, inplace)
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(out)
+    if not all([o_col, h_col, l_col, c_col]):
+        raise ValueError("DataFrame must have open/high/low/close (or Open/High/Low/Close)")
+
+    has_ticker = "Ticker" in out.columns
+    if has_ticker:
+        if "datetime" not in out.columns:
+            raise ValueError("Long format requires 'datetime' column")
+        if not pd.api.types.is_datetime64_any_dtype(out["datetime"]):
+            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        out = out.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
+        pieces = []
+        for name, grp in out.groupby("Ticker", group_keys=False):
+            g = _add_trend_momentum_to_group(grp, o_col, h_col, l_col, c_col, v_col)
+            g["Ticker"] = name
+            pieces.append(g)
+        return pd.concat(pieces, ignore_index=True)
+
     _validate_ohlcv_df(out)
     out = _ensure_atr(out)
-
-    sma50 = ta.sma(out["Close"], length=50)
-    sma200 = ta.sma(out["Close"], length=200)
-    out["Col_DistTo50MA_ATR"] = _atr_normalize(out, out["Close"] - sma50)
-    out["Col_DistTo200MA_ATR"] = _atr_normalize(out, out["Close"] - sma200)
-    out["Col_PriceAbove200MA_ATR"] = _atr_normalize(out, out["Close"] - sma200)
-
-    adx_df = ta.adx(out["High"], out["Low"], out["Close"], length=14)
-    dmp = _indicator_col(adx_df, out.index, exact_names=["DMP_14"], starts_with=["DMP_"])
-    dmn = _indicator_col(adx_df, out.index, exact_names=["DMN_14"], starts_with=["DMN_"])
-    out["Col_ADX14"] = _indicator_col(adx_df, out.index, exact_names=["ADX_14"], starts_with=["ADX_"])
-    out["Col_DI_Diff"] = dmp - dmn
-
-    macd_df = ta.macd(out["Close"], fast=12, slow=26, signal=9)
-    macd_hist = _indicator_col(macd_df, out.index, exact_names=["MACDh_12_26_9"], starts_with=["MACDh_"])
-    macd_val = _indicator_col(macd_df, out.index, exact_names=["MACD_12_26_9"], starts_with=["MACD_"])
-    out["Col_MACD_Hist"] = macd_hist
-    out["Col_MACDV_Normalized"] = _safe_div(macd_val, out["Col_ATR14"])
-
-    out["Col_ROC10"] = ta.roc(out["Close"], length=10)
-    out["Col_ROC20"] = ta.roc(out["Close"], length=20)
-
-    linreg_20 = ta.linreg(out["Close"], length=20)
-    out["Col_20dayLinReg_Slope_ATR"] = _atr_normalize(out, linreg_20 - linreg_20.shift(1))
-    return out
+    return _add_trend_momentum_to_group(out, "Open", "High", "Low", "Close", "Volume")
 
 
 # ====================== OSCILLATORS ======================
+def _add_oscillator_to_group(
+    g: pd.DataFrame, o_col: str, h_col: str, l_col: str, c_col: str, v_col: Optional[str]
+) -> pd.DataFrame:
+    h, l_, c = g[h_col], g[l_col], g[c_col]
+    g = g.copy()
+    if "Col_ATR14" not in g.columns:
+        g = _add_volatility_to_group(g, o_col, h_col, l_col, c_col, v_col)
+
+    g["Col_RSI14"] = ta.rsi(c, length=14)
+
+    stoch_df = ta.stoch(h, l_, c, k=14, d=3, smooth_k=3)
+    g["Col_StochK_14_3"] = _indicator_col(
+        stoch_df, g.index, exact_names=["STOCHk_14_3_3"], starts_with=["STOCHk_"]
+    )
+    g["Col_StochD"] = _indicator_col(
+        stoch_df, g.index, exact_names=["STOCHd_14_3_3"], starts_with=["STOCHd_"]
+    )
+
+    g["Col_CCI20"] = ta.cci(h, l_, c, length=20)
+
+    bb = ta.bbands(c, length=20, std=2.0)
+    bb_low = _indicator_col(bb, g.index, exact_names=["BBL_20_2.0"], starts_with=["BBL_"])
+    bb_up = _indicator_col(bb, g.index, exact_names=["BBU_20_2.0"], starts_with=["BBU_"])
+    g["Col_BollingerPctB"] = _safe_div(c - bb_low, bb_up - bb_low)
+    g["Col_DistUpperBB_ATR"] = _atr_normalize(g, c - bb_up)
+    g["Col_DistLowerBB_ATR"] = _atr_normalize(g, c - bb_low)
+    return g
+
+
 def add_oscillator_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+    """Add oscillator columns. Supports long format (Ticker, datetime, o/h/l/c/v) and single-ticker."""
     out = _copy_if_needed(df, inplace)
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(out)
+    if not all([o_col, h_col, l_col, c_col]):
+        raise ValueError("DataFrame must have open/high/low/close (or Open/High/Low/Close)")
+
+    has_ticker = "Ticker" in out.columns
+    if has_ticker:
+        if "datetime" not in out.columns:
+            raise ValueError("Long format requires 'datetime' column")
+        if not pd.api.types.is_datetime64_any_dtype(out["datetime"]):
+            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        out = out.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
+        pieces = []
+        for name, grp in out.groupby("Ticker", group_keys=False):
+            g = _add_oscillator_to_group(grp, o_col, h_col, l_col, c_col, v_col)
+            g["Ticker"] = name
+            pieces.append(g)
+        return pd.concat(pieces, ignore_index=True)
+
     _validate_ohlcv_df(out)
     out = _ensure_atr(out)
-
-    out["Col_RSI14"] = ta.rsi(out["Close"], length=14)
-
-    stoch_df = ta.stoch(out["High"], out["Low"], out["Close"], k=14, d=3, smooth_k=3)
-    out["Col_StochK_14_3"] = _indicator_col(
-        stoch_df,
-        out.index,
-        exact_names=["STOCHk_14_3_3"],
-        starts_with=["STOCHk_"],
-    )
-    out["Col_StochD"] = _indicator_col(
-        stoch_df,
-        out.index,
-        exact_names=["STOCHd_14_3_3"],
-        starts_with=["STOCHd_"],
-    )
-
-    out["Col_CCI20"] = ta.cci(out["High"], out["Low"], out["Close"], length=20)
-
-    bb = ta.bbands(out["Close"], length=20, std=2.0)
-    bb_low = _indicator_col(bb, out.index, exact_names=["BBL_20_2.0"], starts_with=["BBL_"])
-    bb_mid = _indicator_col(bb, out.index, exact_names=["BBM_20_2.0"], starts_with=["BBM_"])
-    bb_up = _indicator_col(bb, out.index, exact_names=["BBU_20_2.0"], starts_with=["BBU_"])
-
-    _ = bb_mid  # explicit for readability in case strategy code later references middle band
-    out["Col_BollingerPctB"] = _safe_div(out["Close"] - bb_low, bb_up - bb_low)
-    out["Col_DistUpperBB_ATR"] = _atr_normalize(out, out["Close"] - bb_up)
-    out["Col_DistLowerBB_ATR"] = _atr_normalize(out, out["Close"] - bb_low)
-    return out
+    return _add_oscillator_to_group(out, "Open", "High", "Low", "Close", "Volume")
 
 
 # ====================== VOLUME & LIQUIDITY + VWAP ======================
-def add_volume_vwap_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
-    out = _copy_if_needed(df, inplace)
-    _validate_ohlcv_df(out)
-    out = _ensure_atr(out)
+def _add_volume_vwap_to_group(
+    g: pd.DataFrame, o_col: str, h_col: str, l_col: str, c_col: str, v_col: Optional[str]
+) -> pd.DataFrame:
+    h, l_, c = g[h_col], g[l_col], g[c_col]
+    v = g[v_col] if v_col and v_col in g.columns else None
+    if v is None:
+        raise ValueError("Volume required for add_volume_vwap_columns")
+    g = g.copy()
+    if "Col_ATR14" not in g.columns:
+        g = _add_volatility_to_group(g, o_col, h_col, l_col, c_col, v_col)
 
-    session = _session_labels(out.index)
-    intraday = _is_intraday(out.index)
-    typical = (out["High"] + out["Low"] + out["Close"]) / 3.0
+    session = _session_labels_for_group(g)
+    intraday = _is_intraday_for_group(g)
+    typical = (h + l_ + c) / 3.0
 
-    out["Col_RelativeVolume"] = _safe_div(out["Volume"], out["Volume"].rolling(20).mean())
-    out["Col_RelativeVolume_5min"] = _safe_div(out["Volume"], out["Volume"].rolling(5).mean())
+    g["Col_RelativeVolume"] = _safe_div(v, v.rolling(20).mean())
+    g["Col_RelativeVolume_5min"] = _safe_div(v, v.rolling(5).mean())
 
     if intraday:
-        today_cum_vol = out["Volume"].groupby(session).cumsum()
-        yest_total_vol = _session_prev_map(out["Volume"], agg="sum")
-        out["Col_TodayVol_vs_YestVol"] = _safe_div(today_cum_vol, yest_total_vol)
+        today_cum_vol = v.groupby(session).cumsum()
+        yest_total_vol = _session_prev_map(v, agg="sum", session=session)
+        g["Col_TodayVol_vs_YestVol"] = _safe_div(today_cum_vol, yest_total_vol)
     else:
-        out["Col_TodayVol_vs_YestVol"] = _safe_div(out["Volume"], out["Volume"].shift(1))
+        g["Col_TodayVol_vs_YestVol"] = _safe_div(v, v.shift(1))
 
-    out["Col_VolumeSurge_15min_Pct"] = _safe_div(out["Volume"], out["Volume"].rolling(15).mean()) * 100.0
-    minutes_idx = out.index.hour * 60 + out.index.minute + 1
-    out["Col_CumulativeVol_vs_Avg_Pct"] = _safe_div(out["Volume"].cumsum(), out["Volume"].rolling(390).mean() * minutes_idx) * 100.0
-    out["Col_PreMarketVolume_Ratio"] = _safe_div(out["Volume"], out["Volume"].shift(390))
-    out["Col_AvgTradeSize_Ratio"] = np.nan  # placeholder - can be filled later if you have trade count data
-    out["Col_TradeCount_5min"] = np.nan  # placeholder
+    g["Col_VolumeSurge_15min_Pct"] = _safe_div(v, v.rolling(15).mean()) * 100.0
+    if "datetime" in g.columns:
+        dt = pd.to_datetime(g["datetime"])
+        minutes_idx = dt.dt.hour * 60 + dt.dt.minute + 1
+    else:
+        minutes_idx = pd.Series(g.index.hour * 60 + np.asarray(g.index.minute) + 1, index=g.index)
+    g["Col_CumulativeVol_vs_Avg_Pct"] = _safe_div(v.cumsum(), v.rolling(390).mean() * minutes_idx) * 100.0
+    g["Col_PreMarketVolume_Ratio"] = _safe_div(v, v.shift(390))
+    g["Col_AvgTradeSize_Ratio"] = np.nan
+    g["Col_TradeCount_5min"] = np.nan
 
-    obv = ta.obv(out["Close"], out["Volume"])
-    out["Col_OBV_Slope5"] = _safe_div(obv - obv.shift(5), out["Col_ATR14"])
-    out["Col_AccumDist"] = ta.ad(out["High"], out["Low"], out["Close"], out["Volume"])
+    obv = ta.obv(c, v)
+    g["Col_OBV_Slope5"] = _safe_div(obv - obv.shift(5), g["Col_ATR14"])
+    g["Col_AccumDist"] = ta.ad(h, l_, c, v)
 
-    # Use pandas_ta VWAP anchors as requested.
-    daily_vwap = ta.vwap(out["High"], out["Low"], out["Close"], out["Volume"], anchor="D")
-    weekly_vwap = ta.vwap(out["High"], out["Low"], out["Close"], out["Volume"], anchor="W")
+    daily_vwap = ta.vwap(h, l_, c, v, anchor="D")
+    weekly_vwap = ta.vwap(h, l_, c, v, anchor="W")
     if daily_vwap is None:
-        daily_vwap = _safe_div((typical * out["Volume"]).cumsum(), out["Volume"].cumsum())
+        daily_vwap = _safe_div((typical * v).cumsum(), v.cumsum())
     if weekly_vwap is None:
         weekly_vwap = daily_vwap
 
-    out["Col_VWAP_Deviation_ATR"] = _atr_normalize(out, out["Close"] - daily_vwap)
-    out["Col_VWAP_Deviation_Pct"] = _safe_div(out["Close"] - daily_vwap, daily_vwap) * 100.0
+    g["Col_VWAP_Deviation_ATR"] = _atr_normalize(g, c - daily_vwap)
+    g["Col_VWAP_Deviation_Pct"] = _safe_div(c - daily_vwap, daily_vwap) * 100.0
 
-    _, daily_vwap_std = _session_weighted_vwap_std(out)
+    _, daily_vwap_std = _session_weighted_vwap_std_flex(h, l_, c, v, session)
     vwap_p2 = daily_vwap + 2.0 * daily_vwap_std
     vwap_m2 = daily_vwap - 2.0 * daily_vwap_std
 
-    out["Col_VWAP_Slope10_ATR"] = _atr_normalize(out, daily_vwap - daily_vwap.shift(10))
-    out["Col_VWAP_ROC5"] = daily_vwap.pct_change(5) * 100.0
+    g["Col_VWAP_Slope10_ATR"] = _atr_normalize(g, daily_vwap - daily_vwap.shift(10))
+    g["Col_VWAP_ROC5"] = daily_vwap.pct_change(5) * 100.0
 
-    vwap_side = out["Close"] >= daily_vwap
+    vwap_side = c >= daily_vwap
     cross_event = vwap_side.ne(vwap_side.shift(1)).fillna(False)
-    out["Col_BarsSinceVWAP_Cross"] = _bars_since_event(cross_event)
+    g["Col_BarsSinceVWAP_Cross"] = _bars_since_event(cross_event)
 
-    out["Col_VWAP_vs_Open_ATR"] = _atr_normalize(out, daily_vwap - out["Open"])
-    out["Col_VWAP_PosIn2SD_Bands_Pct"] = _safe_div(out["Close"] - vwap_m2, vwap_p2 - vwap_m2) * 100.0
-    return out
+    g["Col_VWAP_vs_Open_ATR"] = _atr_normalize(g, daily_vwap - g[o_col])
+    g["Col_VWAP_PosIn2SD_Bands_Pct"] = _safe_div(c - vwap_m2, vwap_p2 - vwap_m2) * 100.0
+    return g
+
+
+def add_volume_vwap_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+    """Add volume/VWAP columns. Requires Volume. Supports long format and single-ticker."""
+    out = _copy_if_needed(df, inplace)
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(out)
+    if not all([o_col, h_col, l_col, c_col]) or not v_col:
+        raise ValueError("DataFrame must have open/high/low/close/volume (or Open/High/Low/Close/Volume)")
+
+    has_ticker = "Ticker" in out.columns
+    if has_ticker:
+        if "datetime" not in out.columns:
+            raise ValueError("Long format requires 'datetime' column")
+        if not pd.api.types.is_datetime64_any_dtype(out["datetime"]):
+            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        out = out.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
+        pieces = []
+        for name, grp in out.groupby("Ticker", group_keys=False):
+            g = _add_volume_vwap_to_group(grp, o_col, h_col, l_col, c_col, v_col)
+            g["Ticker"] = name
+            pieces.append(g)
+        return pd.concat(pieces, ignore_index=True)
+
+    _validate_ohlcv_df(out)
+    out = _ensure_atr(out)
+    return _add_volume_vwap_to_group(out, "Open", "High", "Low", "Close", "Volume")
 
 
 # ====================== PRICE ACTION & RANGE POSITION ======================
-def add_price_action_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
-    out = _copy_if_needed(df, inplace)
-    _validate_ohlcv_df(out)
-    out = _ensure_atr(out)
+def _add_price_action_to_group(
+    g: pd.DataFrame, o_col: str, h_col: str, l_col: str, c_col: str, v_col: Optional[str]
+) -> pd.DataFrame:
+    o, h, l_, c = g[o_col], g[h_col], g[l_col], g[c_col]
+    g = g.copy()
+    if "Col_ATR14" not in g.columns:
+        g = _add_volatility_to_group(g, o_col, h_col, l_col, c_col, v_col)
 
-    session = _session_labels(out.index)
-    intraday = _is_intraday(out.index)
+    session = _session_labels_for_group(g)
+    intraday = _is_intraday_for_group(g)
 
     if intraday:
-        y_high = _session_prev_map(out["High"], agg="max")
-        y_low = _session_prev_map(out["Low"], agg="min")
+        y_high = _session_prev_map(h, agg="max", session=session)
+        y_low = _session_prev_map(l_, agg="min", session=session)
     else:
-        y_high = out["High"].shift(1)
-        y_low = out["Low"].shift(1)
+        y_high = h.shift(1)
+        y_low = l_.shift(1)
 
-    out["Col_PctInYesterdayRange"] = _safe_div(out["Close"] - y_low, y_high - y_low) * 100.0
+    g["Col_PctInYesterdayRange"] = _safe_div(c - y_low, y_high - y_low) * 100.0
 
-    roll5_high = out["High"].rolling(5).max()
-    roll5_low = out["Low"].rolling(5).min()
-    out["Col_PctIn5DayRange"] = _safe_div(out["Close"] - roll5_low, roll5_high - roll5_low) * 100.0
+    roll5_high = h.rolling(5).max()
+    roll5_low = l_.rolling(5).min()
+    g["Col_PctIn5DayRange"] = _safe_div(c - roll5_low, roll5_high - roll5_low) * 100.0
 
-    out["Col_DistYesterdayHigh_ATR"] = _atr_normalize(out, out["Close"] - y_high)
-    out["Col_DistYesterdayLow_ATR"] = _atr_normalize(out, out["Close"] - y_low)
+    g["Col_DistYesterdayHigh_ATR"] = _atr_normalize(g, c - y_high)
+    g["Col_DistYesterdayLow_ATR"] = _atr_normalize(g, c - y_low)
 
-    daily_close = out["Close"].groupby(session).last()
+    daily_close = c.groupby(session).last()
     hi_52w = daily_close.rolling(252).max()
     lo_52w = daily_close.rolling(252).min()
     mapped_hi_52w = session.map(hi_52w)
     mapped_lo_52w = session.map(lo_52w)
-    out["Col_Dist52wHigh_ATR"] = _atr_normalize(out, out["Close"] - mapped_hi_52w)
-    out["Col_Dist52wLow_ATR"] = _atr_normalize(out, out["Close"] - mapped_lo_52w)
+    g["Col_Dist52wHigh_ATR"] = _atr_normalize(g, c - mapped_hi_52w)
+    g["Col_Dist52wLow_ATR"] = _atr_normalize(g, c - mapped_lo_52w)
 
-    out["Col_OpenToClose_Pct_Sofar"] = _safe_div(out["Close"] - out["Open"], out["Open"]) * 100.0
-    out["Col_CandleBody_vs_ATR"] = _safe_div((out["Close"] - out["Open"]).abs(), out["Col_ATR14"])
-    out["Col_ExtensionFromOpen_ATR"] = _atr_normalize(out, out["Close"] - out["Open"])
-    out["Col_BodyToRangeRatio"] = (out["Close"] - out["Open"]).abs() / (out["High"] - out["Low"] + 1e-8)
-    up_bars = (out["Close"] > out["Open"]).astype(int)
-    out["Col_ConsecutiveUpBars"] = up_bars.groupby((up_bars.diff().ne(0).cumsum())).cumcount()
-    out["Col_MomentumScore_5min"] = _atr_normalize(out, out["Close"] - out["Open"].shift(5))
-    return out
+    g["Col_OpenToClose_Pct_Sofar"] = _safe_div(c - o, o) * 100.0
+    g["Col_CandleBody_vs_ATR"] = _safe_div((c - o).abs(), g["Col_ATR14"])
+    g["Col_ExtensionFromOpen_ATR"] = _atr_normalize(g, c - o)
+    g["Col_BodyToRangeRatio"] = (c - o).abs() / (h - l_ + 1e-8)
+    up_bars = (c > o).astype(int)
+    g["Col_ConsecutiveUpBars"] = up_bars.groupby((up_bars.diff().ne(0).cumsum())).cumcount()
+    g["Col_MomentumScore_5min"] = _atr_normalize(g, c - o.shift(5))
+    return g
+
+
+def add_price_action_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+    """Add price-action columns. Supports long format and single-ticker."""
+    out = _copy_if_needed(df, inplace)
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(out)
+    if not all([o_col, h_col, l_col, c_col]):
+        raise ValueError("DataFrame must have open/high/low/close (or Open/High/Low/Close)")
+
+    has_ticker = "Ticker" in out.columns
+    if has_ticker:
+        if "datetime" not in out.columns:
+            raise ValueError("Long format requires 'datetime' column")
+        if not pd.api.types.is_datetime64_any_dtype(out["datetime"]):
+            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        out = out.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
+        pieces = []
+        for name, grp in out.groupby("Ticker", group_keys=False):
+            g = _add_price_action_to_group(grp, o_col, h_col, l_col, c_col, v_col)
+            g["Ticker"] = name
+            pieces.append(g)
+        return pd.concat(pieces, ignore_index=True)
+
+    _validate_ohlcv_df(out)
+    out = _ensure_atr(out)
+    return _add_price_action_to_group(out, "Open", "High", "Low", "Close", "Volume")
 
 
 # ====================== GAPS & OVERNIGHT MOVES ======================
+def _add_gaps_to_group(
+    g: pd.DataFrame, o_col: str, h_col: str, l_col: str, c_col: str, v_col: Optional[str]
+) -> pd.DataFrame:
+    o, c = g[o_col], g[c_col]
+    g = g.copy()
+    if "Col_ATR14" not in g.columns:
+        g = _add_volatility_to_group(g, o_col, h_col, l_col, c_col, v_col)
+
+    session = _session_labels_for_group(g)
+    intraday = _is_intraday_for_group(g)
+
+    prev_close = _session_prev_map(c, agg="last", session=session) if intraday else c.shift(1)
+    day_open = o.groupby(session).transform("first") if intraday else o
+
+    g["Col_Gap_Pct"] = _safe_div(day_open - prev_close, prev_close) * 100.0
+    g["Col_Gap_ATR"] = _atr_normalize(g, day_open - prev_close)
+    g["Col_PreMarketGap_ATR"] = _atr_normalize(g, day_open - prev_close)
+    g["Col_GapFillProxy_ATR"] = _atr_normalize(g, c - prev_close)
+    g["Col_GapFillProbability_Proxy"] = 1.0 - _safe_div((day_open - prev_close).abs(), g["Col_ATR14"])
+    return g
+
+
 def add_gaps_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+    """Add gap columns. Supports long format and single-ticker."""
     out = _copy_if_needed(df, inplace)
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(out)
+    if not all([o_col, h_col, l_col, c_col]):
+        raise ValueError("DataFrame must have open/high/low/close (or Open/High/Low/Close)")
+
+    has_ticker = "Ticker" in out.columns
+    if has_ticker:
+        if "datetime" not in out.columns:
+            raise ValueError("Long format requires 'datetime' column")
+        if not pd.api.types.is_datetime64_any_dtype(out["datetime"]):
+            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        out = out.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
+        pieces = []
+        for name, grp in out.groupby("Ticker", group_keys=False):
+            g = _add_gaps_to_group(grp, o_col, h_col, l_col, c_col, v_col)
+            g["Ticker"] = name
+            pieces.append(g)
+        return pd.concat(pieces, ignore_index=True)
+
     _validate_ohlcv_df(out)
     out = _ensure_atr(out)
-
-    intraday = _is_intraday(out.index)
-    prev_close = _session_prev_map(out["Close"], agg="last") if intraday else out["Close"].shift(1)
-    day_open = out["Open"].groupby(_session_labels(out.index)).transform("first") if intraday else out["Open"]
-
-    out["Col_Gap_Pct"] = _safe_div(day_open - prev_close, prev_close) * 100.0
-    out["Col_Gap_ATR"] = _atr_normalize(out, day_open - prev_close)
-    out["Col_PreMarketGap_ATR"] = _atr_normalize(out, day_open - prev_close)
-    out["Col_GapFillProxy_ATR"] = _atr_normalize(out, out["Close"] - prev_close)
-    out["Col_GapFillProbability_Proxy"] = 1.0 - _safe_div((day_open - prev_close).abs(), out["Col_ATR14"])
-    return out
+    return _add_gaps_to_group(out, "Open", "High", "Low", "Close", "Volume")
 
 
 # ====================== DISTANCE FROM KEY LEVELS ======================
-def add_key_levels_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
-    out = _copy_if_needed(df, inplace)
-    _validate_ohlcv_df(out)
-    out = _ensure_atr(out)
+def _add_key_levels_to_group(
+    g: pd.DataFrame, o_col: str, h_col: str, l_col: str, c_col: str, v_col: Optional[str]
+) -> pd.DataFrame:
+    c = g[c_col]
+    g = g.copy()
+    if "Col_ATR14" not in g.columns:
+        g = _add_volatility_to_group(g, o_col, h_col, l_col, c_col, v_col)
 
-    close = out["Close"]
     increments = np.select(
-        [close < 20.0, close < 100.0, close < 500.0],
+        [c < 20.0, c < 100.0, c < 500.0],
         [0.5, 1.0, 5.0],
         default=10.0,
     )
-    inc_series = pd.Series(increments, index=out.index, dtype=float)
-    nearest_round = (close / inc_series).round() * inc_series
-    out["Col_DistNearestRound_ATR"] = _atr_normalize(out, close - nearest_round)
+    inc_series = pd.Series(increments, index=g.index, dtype=float)
+    nearest_round = (c / inc_series).round() * inc_series
+    g["Col_DistNearestRound_ATR"] = _atr_normalize(g, c - nearest_round)
+    return g
 
-    return out
+
+def add_key_levels_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+    """Add key-level columns. Supports long format and single-ticker."""
+    out = _copy_if_needed(df, inplace)
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(out)
+    if not all([o_col, h_col, l_col, c_col]):
+        raise ValueError("DataFrame must have open/high/low/close (or Open/High/Low/Close)")
+
+    has_ticker = "Ticker" in out.columns
+    if has_ticker:
+        if "datetime" not in out.columns:
+            raise ValueError("Long format requires 'datetime' column")
+        if not pd.api.types.is_datetime64_any_dtype(out["datetime"]):
+            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        out = out.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
+        pieces = []
+        for name, grp in out.groupby("Ticker", group_keys=False):
+            g = _add_key_levels_to_group(grp, o_col, h_col, l_col, c_col, v_col)
+            g["Ticker"] = name
+            pieces.append(g)
+        return pd.concat(pieces, ignore_index=True)
+
+    _validate_ohlcv_df(out)
+    out = _ensure_atr(out)
+    return _add_key_levels_to_group(out, "Open", "High", "Low", "Close", "Volume")
 
 
 # ====================== MARKET CONTEXT & RELATIVE ======================
-def add_market_context_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
-    """
-    Market-relative columns.
+def _add_market_context_to_group(
+    g: pd.DataFrame, o_col: str, h_col: str, l_col: str, c_col: str, v_col: Optional[str]
+) -> pd.DataFrame:
+    c = g[c_col]
+    g = g.copy()
 
-    Extend with external benchmark data by pre-merging one or more of these columns
-    into the same DataFrame index before calling this function:
-        - SPX_Close / SPY_Close (broad market proxy)
-        - Sector_Close / XLK_Close / XLF_Close / etc. (sector proxy)
+    stock_ret_1d = c.pct_change()
+    stock_ret_20d = c.pct_change(20)
 
-    If external series are missing, output columns are created as NaN.
-    """
-    out = _copy_if_needed(df, inplace)
-    _validate_ohlcv_df(out)
-
-    stock_ret_1d = out["Close"].pct_change()
-    stock_ret_20d = out["Close"].pct_change(20)
-
-    spx = _pick_external_series(out, ["SPX_Close", "SPY_Close", "Benchmark_Close"])
-    sector = _pick_external_series(out, ["Sector_Close", "XLK_Close", "XLF_Close", "XLY_Close", "XLI_Close"])
-    spy_for_beta = _pick_external_series(out, ["SPY_Close", "SPX_Close", "Benchmark_Close"])
+    spx = _pick_external_series(g, ["SPX_Close", "SPY_Close", "Benchmark_Close"])
+    sector = _pick_external_series(g, ["Sector_Close", "XLK_Close", "XLF_Close", "XLY_Close", "XLI_Close"])
+    spy_for_beta = _pick_external_series(g, ["SPY_Close", "SPX_Close", "Benchmark_Close"])
 
     if spx is not None:
-        out["Col_StockVsSPX_TodayPct"] = (stock_ret_1d - spx.pct_change()) * 100.0
+        g["Col_StockVsSPX_TodayPct"] = (stock_ret_1d - spx.pct_change()) * 100.0
     else:
-        out["Col_StockVsSPX_TodayPct"] = np.nan
+        g["Col_StockVsSPX_TodayPct"] = np.nan
 
     if sector is not None:
-        out["Col_RelStrengthVsSector_20d"] = (stock_ret_20d - sector.pct_change(20)) * 100.0
+        g["Col_RelStrengthVsSector_20d"] = (stock_ret_20d - sector.pct_change(20)) * 100.0
     else:
-        out["Col_RelStrengthVsSector_20d"] = np.nan
+        g["Col_RelStrengthVsSector_20d"] = np.nan
 
     if spy_for_beta is not None:
         mkt_ret = spy_for_beta.pct_change()
         cov = stock_ret_1d.rolling(60).cov(mkt_ret)
         var = mkt_ret.rolling(60).var()
-        out["Col_Beta60d"] = _safe_div(cov, var)
-        out["Col_CorrToSPY_10d"] = stock_ret_1d.rolling(10).corr(mkt_ret)
+        g["Col_Beta60d"] = _safe_div(cov, var)
+        g["Col_CorrToSPY_10d"] = stock_ret_1d.rolling(10).corr(mkt_ret)
     else:
-        out["Col_Beta60d"] = np.nan
-        out["Col_CorrToSPY_10d"] = np.nan
+        g["Col_Beta60d"] = np.nan
+        g["Col_CorrToSPY_10d"] = np.nan
 
-    return out
+    return g
+
+
+def add_market_context_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+    """
+    Add market-relative columns. Supports long format and single-ticker.
+
+    Extend with external benchmark data by pre-merging SPX_Close/SPY_Close,
+    Sector_Close, etc. If missing, columns are NaN.
+    """
+    out = _copy_if_needed(df, inplace)
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(out)
+    if not all([o_col, h_col, l_col, c_col]):
+        raise ValueError("DataFrame must have open/high/low/close (or Open/High/Low/Close)")
+
+    has_ticker = "Ticker" in out.columns
+    if has_ticker:
+        if "datetime" not in out.columns:
+            raise ValueError("Long format requires 'datetime' column")
+        if not pd.api.types.is_datetime64_any_dtype(out["datetime"]):
+            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        out = out.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
+        pieces = []
+        for name, grp in out.groupby("Ticker", group_keys=False):
+            g = _add_market_context_to_group(grp, o_col, h_col, l_col, c_col, v_col)
+            g["Ticker"] = name
+            pieces.append(g)
+        return pd.concat(pieces, ignore_index=True)
+
+    _validate_ohlcv_df(out)
+    return _add_market_context_to_group(out, "Open", "High", "Low", "Close", "Volume")
 
 
 # ====================== SIMPLE TIME / SESSION ======================
-def add_time_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
-    out = _copy_if_needed(df, inplace)
-    _validate_ohlcv_df(out)
+def _add_time_to_group(
+    g: pd.DataFrame, o_col: str, h_col: str, l_col: str, c_col: str, v_col: Optional[str]
+) -> pd.DataFrame:
+    g = g.copy()
+    if "datetime" in g.columns:
+        dt = pd.to_datetime(g["datetime"])
+        hour_frac = dt.dt.hour + (dt.dt.minute / 60.0)
+        dayofweek = dt.dt.dayofweek
+        mins_raw = (dt.dt.hour - 9) * 60 + np.asarray(dt.dt.minute)
+    else:
+        hour_frac = g.index.hour + (g.index.minute / 60.0)
+        dayofweek = g.index.dayofweek
+        mins_raw = (g.index.hour - 9) * 60 + np.asarray(g.index.minute)
 
-    out["Col_EntryTime_HourNumeric"] = out.index.hour + (out.index.minute / 60.0)
-    out["Col_DayOfWeek"] = out.index.dayofweek
+    g["Col_EntryTime_HourNumeric"] = hour_frac
+    g["Col_DayOfWeek"] = dayofweek
 
-    if _is_intraday(out.index):
-        hhmm = out.index.hour + (out.index.minute / 60.0)
-        out["Col_SessionFlag"] = np.select(
+    if _is_intraday_for_group(g):
+        g["Col_SessionFlag"] = np.select(
             [
-                (hhmm >= 4.0) & (hhmm < 9.5),   # premarket
-                (hhmm >= 9.5) & (hhmm < 16.0),  # regular session
-                (hhmm >= 16.0) & (hhmm < 20.0), # postmarket
+                (hour_frac >= 4.0) & (hour_frac < 9.5),
+                (hour_frac >= 9.5) & (hour_frac < 16.0),
+                (hour_frac >= 16.0) & (hour_frac < 20.0),
             ],
             [1, 2, 3],
             default=0,
         )
     else:
-        out["Col_SessionFlag"] = 2
-    mins_raw = (out.index.hour - 9) * 60 + np.asarray(out.index.minute)
-    out["Col_MinutesSinceOpen"] = np.maximum(mins_raw, 0)
-    return out
+        g["Col_SessionFlag"] = 2
+    g["Col_MinutesSinceOpen"] = np.maximum(mins_raw, 0)
+    return g
 
 
-# ====================== MASTER ORCHESTRATOR ======================
-def add_all_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+def add_time_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+    """Add time/session columns. Supports long format and single-ticker."""
     out = _copy_if_needed(df, inplace)
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(out)
+    if not all([o_col, h_col, l_col, c_col]):
+        raise ValueError("DataFrame must have open/high/low/close (or Open/High/Low/Close)")
+
+    has_ticker = "Ticker" in out.columns
+    if has_ticker:
+        if "datetime" not in out.columns:
+            raise ValueError("Long format requires 'datetime' column")
+        if not pd.api.types.is_datetime64_any_dtype(out["datetime"]):
+            out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
+        out = out.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
+        pieces = []
+        for name, grp in out.groupby("Ticker", group_keys=False):
+            g = _add_time_to_group(grp, o_col, h_col, l_col, c_col, v_col)
+            g["Ticker"] = name
+            pieces.append(g)
+        return pd.concat(pieces, ignore_index=True)
+
     _validate_ohlcv_df(out)
+    return _add_time_to_group(out, "Open", "High", "Low", "Close", "Volume")
+
+
+# ====================== MASTER ORCHESTRATORS ======================
+def add_all_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+    """Add all 67 core columns. Supports long format (Ticker, datetime, o/h/l/c/v) and single-ticker (DatetimeIndex, Open/High/Low/Close/Volume)."""
+    out = _copy_if_needed(df, inplace)
 
     out = add_volatility_columns(out, inplace=True)
     out = add_trend_momentum_columns(out, inplace=True)
@@ -639,6 +967,19 @@ def add_all_columns(df: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
     out = add_market_context_columns(out, inplace=True)
     out = add_time_columns(out, inplace=True)
     return out
+
+
+def add_full_enrichment(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Full enrichment pipeline: core + indicators + cruncher + advanced cruncher.
+    Call once before backtests. Requires Volume for full output.
+    """
+    df = df.copy()
+    df = add_all_columns(df)
+    df = add_all_missing_indicators(df)
+    df = add_cruncher_context_columns(df)
+    df = add_advanced_cruncher_columns(df)
+    return df
 
 
 # ====================== PUBLIC METADATA API ======================
@@ -654,16 +995,6 @@ def get_column_groups() -> Dict[str, List[str]]:
 
 
 # ====================== 78 MISSING INDICATORS (TA-Lib non-CDL + Backtrader uniques) ======================
-def _pick_ohlcv_columns(df: pd.DataFrame) -> tuple:
-    """Return (open, high, low, close, volume) column names. Accepts both long and single-ticker formats."""
-    o = "open" if "open" in df.columns else ("Open" if "Open" in df.columns else None)
-    h = "high" if "high" in df.columns else ("High" if "High" in df.columns else None)
-    l = "low" if "low" in df.columns else ("Low" if "Low" in df.columns else None)
-    c = "close" if "close" in df.columns else ("Close" if "Close" in df.columns else None)
-    v = "volume" if "volume" in df.columns else ("Volume" if "Volume" in df.columns else None)
-    return o, h, l, c, v
-
-
 def _pick_indicator_col(ind_df: Optional[pd.DataFrame], index: pd.Index, prefixes: List[str]) -> pd.Series:
     """Extract first matching column from pandas_ta output by prefix."""
     if ind_df is None or ind_df.empty:
@@ -1135,6 +1466,165 @@ def add_cruncher_context_columns(df: pd.DataFrame) -> pd.DataFrame:
         df = _add_cruncher_to_group(df)
 
     return df.reset_index(drop=True) if has_ticker else df
+
+
+# ====================== ADVANCED CRUNCHER (18 high-signal columns) ======================
+def add_advanced_cruncher_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add 18 advanced cruncher columns for post-backtest optimization.
+    Run after add_cruncher_context_columns (requires Col_Gap_Pct, Col_ExtensionFromDaily9EMA_ATR,
+    Col_DollarVolume_20dAvg, Col_RelativeVolume_First30min, Col_ATR14, etc.).
+    Supports long format (Ticker, datetime) and single-ticker (DatetimeIndex).
+    """
+    df = df.copy()
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(df)
+    if not all([o_col, h_col, l_col, c_col]):
+        raise ValueError("DataFrame must have open/high/low/close")
+
+    has_ticker = "Ticker" in df.columns
+    if has_ticker:
+        if "datetime" not in df.columns:
+            raise ValueError("Long format requires 'datetime' column")
+        if not pd.api.types.is_datetime64_any_dtype(df["datetime"]):
+            df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.sort_values(["Ticker", "datetime"]).reset_index(drop=True)
+    elif isinstance(df.index, pd.DatetimeIndex):
+        df = df.sort_index()
+
+    def _add_advanced_to_group(g: pd.DataFrame) -> pd.DataFrame:
+        if len(g) == 0:
+            return g
+        o = g[o_col]
+        h = g[h_col]
+        l_ = g[l_col]
+        c = g[c_col]
+        idx = g.index
+
+        session_start = _session_labels_for_group(g)
+        if "datetime" in g.columns:
+            time = pd.to_datetime(g["datetime"])
+        else:
+            time = pd.Series(g.index, index=idx)
+        # Minutes from market open (9:30 ET), not midnight
+        market_open = session_start + pd.Timedelta(hours=9, minutes=30)
+        time_since_session = time - market_open
+
+        gap_pct = g.get("Col_Gap_Pct", _safe_div(c - c.shift(1).fillna(c.iloc[0]), c.shift(1).fillna(c.iloc[0])) * 100)
+        atr14 = g.get("Col_ATR14", pd.Series(np.nan, index=idx))
+
+        # Cross-sectional ranks (within session for this ticker)
+        g["Col_Gap_Pct_Rank_Day"] = gap_pct.groupby(session_start).rank(pct=True) * 100
+        rv30 = g.get("Col_RelativeVolume_First30min", pd.Series(np.nan, index=idx))
+        g["Col_RelativeVolume_First30min_Rank_Day"] = rv30.groupby(session_start).rank(pct=True) * 100
+        dv = g.get("Col_DollarVolume_20dAvg", pd.Series(np.nan, index=idx))
+        g["Col_DollarVolume_Rank_Day"] = dv.groupby(session_start).rank(pct=True) * 100
+        ext9 = g.get("Col_ExtensionFromDaily9EMA_ATR", pd.Series(np.nan, index=idx))
+        g["Col_ExtensionFromDaily9EMA_Rank_Day"] = ext9.groupby(session_start).rank(pct=True) * 100
+
+        # Pre-market & open dynamics
+        pre_gap = g.get("Col_PreMarketGap_ATR", pd.Series(0.0, index=idx))
+        g["Col_PreMarketStrength_Pct"] = _safe_div(pre_gap, atr14.replace(0, np.nan)) * 100
+
+        def _first_n_return(n_min: int) -> pd.Series:
+            mins_since = time_since_session.dt.total_seconds() / 60
+            out = pd.Series(np.nan, index=idx)
+            for sess in session_start.unique():
+                mask_sess = (session_start == sess)
+                mask_window = (mins_since <= n_min) & mask_sess
+                if not mask_window.any():
+                    continue
+                c0 = c.loc[mask_sess].iloc[0]
+                c_last = c.loc[mask_window].iloc[-1]
+                ret = float(_safe_div(pd.Series([c_last - c0]), pd.Series([c0])).iloc[0]) * 100
+                out.loc[mask_sess] = ret
+            return out
+
+        g["Col_First15minReturn_Pct"] = _first_n_return(15)
+        g["Col_FirstHourReturn_Pct"] = _first_n_return(60)
+
+        # Last hour return (minutes 330+ for 390-min session)
+        def _last_hour_return() -> pd.Series:
+            mins = time_since_session.dt.total_seconds() / 60
+            out = pd.Series(np.nan, index=idx)
+            for sess in session_start.unique():
+                mask = (mins >= 330) & (session_start == sess)
+                if mask.sum() < 2:
+                    continue
+                slice_c = c.loc[mask]
+                ret = float(_safe_div(pd.Series([slice_c.iloc[-1] - slice_c.iloc[0]]), pd.Series([slice_c.iloc[0]])).iloc[0]) * 100
+                out.loc[session_start == sess] = ret
+            return out
+
+        g["Col_LastHourReturn_Pct"] = _last_hour_return()
+
+        # Lunch hour (11:30–13:30 ET ≈ 120–240 min from 9:30)
+        def _lunch_return() -> pd.Series:
+            mins = time_since_session.dt.total_seconds() / 60
+            out = pd.Series(np.nan, index=idx)
+            for sess in session_start.unique():
+                mask = (mins >= 120) & (mins < 240) & (session_start == sess)
+                if mask.sum() < 2:
+                    continue
+                slice_c = c.loc[mask]
+                ret = float(_safe_div(pd.Series([slice_c.iloc[-1] - slice_c.iloc[0]]), pd.Series([slice_c.iloc[0]])).iloc[0]) * 100
+                out.loc[session_start == sess] = ret
+            return out
+
+        g["Col_LunchHourPerformance_Pct"] = _lunch_return()
+
+        # Volatility regime
+        g["Col_VolatilityContraction_5d"] = _safe_div(atr14, atr14.rolling(5, min_periods=1).mean())
+        daily_atr = atr14.groupby(session_start).last()
+        expand = daily_atr > daily_atr.shift(1)
+        streak_groups = (expand != expand.shift(1)).cumsum()
+        streak = expand.groupby(streak_groups).cumsum().astype(int)
+        streak = np.where(expand.values, streak.values, 0)
+        g["Col_ATR_Expansion_Streak"] = session_start.map(pd.Series(streak, index=daily_atr.index))
+
+        vc = g["Col_VolatilityContraction_5d"]
+        g["Col_VolatilityRegime"] = pd.cut(
+            vc,
+            bins=[0, 0.8, 1.2, 999],
+            labels=["Low", "Normal", "High"]
+        ).astype(str)
+
+        # Higher-timeframe
+        daily_close = c.groupby(session_start).last()
+        sma20d = daily_close.rolling(20, min_periods=1).mean()
+        g["Col_AboveWeekly20MA"] = (c >= session_start.map(sma20d)).astype(int)
+
+        monthly_high = daily_close.rolling(21, min_periods=1).max()
+        monthly_low = daily_close.rolling(21, min_periods=1).min()
+        g["Col_PctInMonthlyRange"] = _safe_div(
+            c - session_start.map(monthly_low),
+            session_start.map(monthly_high) - session_start.map(monthly_low)
+        ) * 100
+
+        # Interactions
+        g["Col_GapPct_x_RelVolRank_Day"] = gap_pct * g["Col_RelativeVolume_First30min_Rank_Day"]
+        g["Col_ExtensionATR_x_VolContraction"] = ext9 * g["Col_VolatilityContraction_5d"]
+
+        five_day_mean = daily_close.rolling(5, min_periods=1).mean()
+        g["Col_DistFrom5DayMean_ATR"] = _atr_normalize(g, c - session_start.map(five_day_mean))
+
+        # Consecutive gap days (|gap| > 1%)
+        daily_gap = gap_pct.groupby(session_start).first()
+        has_gap = daily_gap.abs() > 1.0
+        groups = (has_gap != has_gap.shift(1)).cumsum()
+        streak_s = (has_gap.groupby(groups).cumcount() + 1).where(has_gap, 0)
+        g["Col_ConsecutiveGapDays"] = session_start.map(pd.Series(streak_s.values, index=daily_gap.index))
+
+        return g
+
+    if has_ticker:
+        pieces = []
+        for name, grp in df.groupby("Ticker", group_keys=False):
+            g = _add_advanced_to_group(grp)
+            g["Ticker"] = name
+            pieces.append(g)
+        return pd.concat(pieces, ignore_index=True)
+
+    return _add_advanced_to_group(df)
 
 
 # ====================== CONTINUOUS INTRATRADE TRACKING ======================
