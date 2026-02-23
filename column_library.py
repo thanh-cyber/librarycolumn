@@ -1,6 +1,6 @@
 """
 ===========================================================================
-# ENTRY-ONLY COLUMN LIBRARY — 67 core + 103 indicators + 28 cruncher (optional)
+# ENTRY-ONLY COLUMN LIBRARY — 67 core + 103 indicators + 25 cruncher (optional)
 ===========================================================================
 Portable Column Library (single-file, reusable across backtesting projects)
 
@@ -196,6 +196,9 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_VolumeSurge_1min_Ratio",
         "Col_IntradayATR_Ratio",
         "Col_StdDev_Last10Bars_ATR",
+        "Col_DistToVWAP_Slope10_ATR",
+        "Col_MomentumDivergence_RSI",
+        "Col_DistFromSessionVWAP_ATR",
         "Col_GapPct_x_RelVol30",
         "Col_GapPct_x_ExtensionATR",
     ],
@@ -955,7 +958,7 @@ def add_final_22_missing_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ====================== CRUNCHER CONTEXT (entry-only, optimization-ready) ======================
 def add_cruncher_context_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add 22 cruncher-context columns (gap, ORB, extension from 9 EMA, volume, volatility,
+    Add 25 cruncher-context columns (gap, ORB, extension from 9 EMA, volume, volatility,
     interaction terms). Entry-only, lookahead-free. Supports long format (Ticker, datetime,
     open/high/low/close/volume) and single-ticker (DatetimeIndex, Open/High/Low/Close/Volume).
     Uses _safe_div and _atr_normalize; computes Col_ATR14 in-group if not present.
@@ -1093,6 +1096,27 @@ def add_cruncher_context_columns(df: pd.DataFrame) -> pd.DataFrame:
         g["Col_IntradayATR_Ratio"] = _safe_div(range_15, g["Col_ATR14"])
         g["Col_StdDev_Last10Bars_ATR"] = _atr_normalize(g, c.rolling(10, min_periods=1).std())
 
+        # Tier 3: VWAP slope, RSI divergence, session VWAP distance
+        typical = (h + l_ + c) / 3
+        if v is not None:
+            pv = typical * v
+            session_pv = pv.groupby(session_start).cumsum()
+            session_vol = v.groupby(session_start).cumsum()
+            session_vwap = _safe_div(session_pv, session_vol)
+            vwap_slope = session_vwap.rolling(10, min_periods=1).mean().diff()
+            g["Col_DistToVWAP_Slope10_ATR"] = _atr_normalize(g, vwap_slope)
+            g["Col_DistFromSessionVWAP_ATR"] = _atr_normalize(g, c - session_vwap)
+        else:
+            g["Col_DistToVWAP_Slope10_ATR"] = pd.Series(np.nan, index=idx)
+            g["Col_DistFromSessionVWAP_ATR"] = pd.Series(np.nan, index=idx)
+        rsi = g["Col_RSI14"] if "Col_RSI14" in g.columns else ta.rsi(c, length=14)
+        if rsi is not None:
+            price_change = c.pct_change().replace([np.inf, -np.inf], np.nan)
+            rsi_change = rsi.pct_change().replace([np.inf, -np.inf], np.nan)
+            g["Col_MomentumDivergence_RSI"] = (rsi_change - price_change).replace([np.inf, -np.inf], np.nan)
+        else:
+            g["Col_MomentumDivergence_RSI"] = pd.Series(np.nan, index=idx)
+
         # Interaction terms
         g["Col_GapPct_x_RelVol30"] = gap_pct * g.get("Col_RelativeVolume_First30min", pd.Series(1.0, index=idx))
         g["Col_GapPct_x_ExtensionATR"] = gap_pct * g.get("Col_ExtensionFromDaily9EMA_ATR", pd.Series(1.0, index=idx))
@@ -1118,6 +1142,9 @@ def add_cruncher_context_columns(df: pd.DataFrame) -> pd.DataFrame:
 CONTINUOUS_TRACKING_COLUMNS: List[str] = [
     "Col_ExtensionFromDaily9EMA_ATR",
     "Col_VWAP_Deviation_ATR",
+    "Col_DistToVWAP_Slope10_ATR",
+    "Col_DistFromSessionVWAP_ATR",
+    "Col_MomentumDivergence_RSI",
     "Col_RSI14",
     "Col_StochK_14_3",
     "Col_MACD_Hist",
