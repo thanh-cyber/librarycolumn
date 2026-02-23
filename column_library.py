@@ -12,6 +12,7 @@ Usage example:
     from column_library import (
         add_all_columns,
         add_all_missing_indicators,
+        add_final_22_missing_columns,
         add_volatility_columns,
         add_volume_vwap_columns,
         get_all_column_names,
@@ -138,6 +139,33 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_DayOfWeek",
         "Col_SessionFlag",
         "Col_MinutesSinceOpen",
+    ],
+    "final_22": [
+        "Col_ALMA_10_6_0.85",
+        "Col_FWMA_10",
+        "Col_HWMA_10",
+        "Col_PWMA_10",
+        "Col_ZLMA_10",
+        "Col_SuperTrend",
+        "Col_SuperTrend_Direction",
+        "Col_Keltner_Upper",
+        "Col_Keltner_Lower",
+        "Col_Keltner_Width_ATR",
+        "Col_Donchian_Upper",
+        "Col_Donchian_Lower",
+        "Col_MassIndex_25",
+        "Col_UlcerIndex_14",
+        "Col_ChoppinessIndex_14",
+        "Col_ChaikinMoneyFlow_20",
+        "Col_ElderForceIndex_13",
+        "Col_EaseOfMovement_14",
+        "Col_NVI",
+        "Col_PVI",
+        "Col_PSAR",
+        "Col_QStick_10",
+        "Col_RelativeVigorIndex",
+        "Col_RVISignal",
+        "Col_SchaffTrendCycle",
     ],
 }
 
@@ -615,7 +643,7 @@ def _pick_indicator_col(ind_df: Optional[pd.DataFrame], index: pd.Index, prefixe
 
 def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add 78 TA-Lib non-CDL and Backtrader-unique indicators via pandas_ta.
+    Add 103 TA-Lib / Backtrader / pandas_ta indicators in one pass (78 + 25).
 
     Works on long-format minute-bar DataFrames with columns: Ticker, datetime,
     open, high, low, close, volume. Also supports single-ticker with DatetimeIndex
@@ -685,9 +713,9 @@ def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
         denom = dmp + dmn
         g["Col_DX14"] = np.where(denom > 0, 100 * (dmp - dmn).abs() / denom, np.nan)
         atr14 = ta.atr(ohlc["high"], ohlc["low"], ohlc["close"], length=14)
-        atr_safe = atr14.replace(0, np.nan) if atr14 is not None else pd.Series(np.nan, index=g.index)
-        g["Col_PLUS_DI14"] = 100 * dmp / atr_safe if atr14 is not None else np.nan
-        g["Col_MINUS_DI14"] = 100 * dmn / atr_safe if atr14 is not None else np.nan
+        atr_safe = atr14.replace(0, np.nan) if atr14 is not None else pd.Series(np.nan, index=idx)
+        g["Col_PLUS_DI14"] = (100 * _safe_div(dmp, atr_safe)) if atr14 is not None else pd.Series(np.nan, index=idx)
+        g["Col_MINUS_DI14"] = (100 * _safe_div(dmn, atr_safe)) if atr14 is not None else pd.Series(np.nan, index=idx)
         g["Col_APO"] = ta.apo(ohlc["close"], fast=12, slow=26)
         aroon_df = ta.aroon(ohlc["high"], ohlc["low"], length=14)
         g["Col_AROON_UP"] = _col(["AROONU"], aroon_df)
@@ -817,6 +845,55 @@ def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
         g["Col_Vortex_Plus"] = _col(["VTXP"], vortex_df)
         g["Col_Vortex_Minus"] = _col(["VTXM"], vortex_df)
 
+        # === Final 25 (ALMA, FWMA, HWMA, PWMA, ZLMA, SuperTrend, Keltner, Donchian, etc.) ===
+        g["Col_ALMA_10_6_0.85"] = ta.alma(ohlc["close"], length=10, sigma=6.0, offset=0.85)
+        g["Col_FWMA_10"] = ta.fwma(ohlc["close"], length=10)
+        g["Col_HWMA_10"] = ta.hwma(ohlc["close"], length=10)
+        g["Col_PWMA_10"] = ta.pwma(ohlc["close"], length=10)
+        g["Col_ZLMA_10"] = ta.zlma(ohlc["close"], length=10)
+        st_df = ta.supertrend(ohlc["high"], ohlc["low"], ohlc["close"], length=10, multiplier=3.0)
+        g["Col_SuperTrend"] = _col(["SUPERT_"], st_df) if st_df is not None else pd.Series(np.nan, index=idx)
+        g["Col_SuperTrend_Direction"] = _col(["SUPERTd"], st_df) if st_df is not None else pd.Series(np.nan, index=idx)
+        kc_df = ta.kc(ohlc["high"], ohlc["low"], ohlc["close"], length=20, scalar=2.0)
+        kcu = _col(["KCU"], kc_df)
+        kcl = _col(["KCL"], kc_df)
+        g["Col_Keltner_Upper"] = kcu
+        g["Col_Keltner_Lower"] = kcl
+        g["Col_Keltner_Width_ATR"] = _safe_div(kcu - kcl, atr_safe)
+        dc_df = ta.donchian(ohlc["high"], ohlc["low"], length=20)
+        g["Col_Donchian_Upper"] = _col(["DCU"], dc_df) if dc_df is not None else pd.Series(np.nan, index=idx)
+        g["Col_Donchian_Lower"] = _col(["DCL"], dc_df) if dc_df is not None else pd.Series(np.nan, index=idx)
+        massi_ser = ta.massi(ohlc["high"], ohlc["low"], length=25)
+        g["Col_MassIndex_25"] = massi_ser if massi_ser is not None else pd.Series(np.nan, index=idx)
+        g["Col_UlcerIndex_14"] = ta.ui(ohlc["close"], length=14)
+        g["Col_ChoppinessIndex_14"] = ta.chop(ohlc["high"], ohlc["low"], ohlc["close"], length=14)
+        if "volume" in ohlc.columns:
+            g["Col_ChaikinMoneyFlow_20"] = ta.cmf(ohlc["high"], ohlc["low"], ohlc["close"], ohlc["volume"], length=20)
+            g["Col_ElderForceIndex_13"] = ta.efi(ohlc["close"], ohlc["volume"], length=13)
+            eom_ser = ta.eom(ohlc["high"], ohlc["low"], ohlc["close"], ohlc["volume"], length=14)
+            g["Col_EaseOfMovement_14"] = eom_ser if eom_ser is not None else pd.Series(np.nan, index=idx)
+            nvi_out = ta.nvi(ohlc["close"], ohlc["volume"])
+            g["Col_NVI"] = _col(["NVI"], nvi_out) if isinstance(nvi_out, pd.DataFrame) else (nvi_out if nvi_out is not None else pd.Series(np.nan, index=idx))
+            pvi_out = ta.pvi(ohlc["close"], ohlc["volume"])
+            g["Col_PVI"] = _col(["PVI"], pvi_out) if isinstance(pvi_out, pd.DataFrame) else (pvi_out if pvi_out is not None else pd.Series(np.nan, index=idx))
+        else:
+            for col in ["Col_ChaikinMoneyFlow_20", "Col_ElderForceIndex_13", "Col_EaseOfMovement_14", "Col_NVI", "Col_PVI"]:
+                g[col] = pd.Series(np.nan, index=idx)
+        psar_final_df = ta.psar(ohlc["high"], ohlc["low"], ohlc["close"])
+        if psar_final_df is not None:
+            pl = _col(["PSARl"], psar_final_df)
+            ps = _col(["PSARs"], psar_final_df)
+            g["Col_PSAR"] = pl.fillna(ps)
+        else:
+            g["Col_PSAR"] = pd.Series(np.nan, index=idx)
+        g["Col_QStick_10"] = ta.qstick(ohlc["open"], ohlc["close"], length=10)
+        rvi_ser = ta.rvi(ohlc["close"], ohlc["high"], ohlc["low"], length=14)
+        g["Col_RelativeVigorIndex"] = rvi_ser if rvi_ser is not None else pd.Series(np.nan, index=idx)
+        rvi_sma = ta.sma(rvi_ser, length=4) if rvi_ser is not None else None
+        g["Col_RVISignal"] = rvi_sma if rvi_sma is not None else pd.Series(np.nan, index=idx)
+        stc_df = ta.stc(ohlc["close"])
+        g["Col_SchaffTrendCycle"] = _col(["STC_"], stc_df) if stc_df is not None and not stc_df.empty else pd.Series(np.nan, index=idx)
+
         return g
 
     if has_ticker:
@@ -831,4 +908,14 @@ def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df = _add_indicators_to_group(df)
 
     return df.reset_index(drop=True) if has_ticker else df
+
+
+def add_final_22_missing_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Backward-compatible wrapper: the 25 extra indicators (ALMA, SuperTrend, Keltner,
+    Donchian, Mass Index, Ulcer, Choppiness, CMF, EFI, EOM, NVI, PVI, PSAR, QStick,
+    RVI/RVISignal, Schaff Trend Cycle) are now included in add_all_missing_indicators.
+    This function simply calls add_all_missing_indicators so one call adds all 103.
+    """
+    return add_all_missing_indicators(df)
 
