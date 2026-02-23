@@ -13,6 +13,7 @@ Usage example:
         add_all_columns,
         add_all_missing_indicators,
         add_final_22_missing_columns,
+        add_cruncher_context_columns,
         add_volatility_columns,
         add_volume_vwap_columns,
         get_all_column_names,
@@ -166,6 +167,35 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_RelativeVigorIndex",
         "Col_RVISignal",
         "Col_SchaffTrendCycle",
+    ],
+    "cruncher_context": [
+        "Col_Gap_Pct",
+        "Col_GapFill_15min_Pct",
+        "Col_GapFill_15min_Zscore",
+        "Col_ORB_5min_BreakHigh",
+        "Col_ORB_5min_BreakLow",
+        "Col_ORB_5min_DistHigh_ATR",
+        "Col_ORB_15min_BreakHigh",
+        "Col_ORB_15min_BreakLow",
+        "Col_ORB_15min_DistHigh_ATR",
+        "Col_ORB_30min_BreakHigh",
+        "Col_ORB_30min_BreakLow",
+        "Col_ORB_30min_DistHigh_ATR",
+        "Col_ORB_60min_BreakHigh",
+        "Col_ORB_60min_BreakLow",
+        "Col_ORB_60min_DistHigh_ATR",
+        "Col_ExtensionFromDaily9EMA_ATR",
+        "Col_ExtensionFromDaily9EMA_Rank",
+        "Col_MultiDaySlope_5d",
+        "Col_InsideDay",
+        "Col_DollarVolume_20dAvg",
+        "Col_RelativeVolume_First30min",
+        "Col_RelativeVolume_First30min_Rank",
+        "Col_VolumeSurge_1min_Ratio",
+        "Col_IntradayATR_Ratio",
+        "Col_StdDev_Last10Bars_ATR",
+        "Col_GapPct_x_RelVol30",
+        "Col_GapPct_x_ExtensionATR",
     ],
 }
 
@@ -711,7 +741,7 @@ def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
         dmp = _col(["DMP"], adx_df)
         dmn = _col(["DMN"], adx_df)
         denom = dmp + dmn
-        g["Col_DX14"] = np.where(denom > 0, 100 * (dmp - dmn).abs() / denom, np.nan)
+        g["Col_DX14"] = np.where(denom > 0, 100 * _safe_div((dmp - dmn).abs(), denom), np.nan)
         atr14 = ta.atr(ohlc["high"], ohlc["low"], ohlc["close"], length=14)
         atr_safe = atr14.replace(0, np.nan) if atr14 is not None else pd.Series(np.nan, index=idx)
         g["Col_PLUS_DI14"] = (100 * _safe_div(dmp, atr_safe)) if atr14 is not None else pd.Series(np.nan, index=idx)
@@ -918,4 +948,165 @@ def add_final_22_missing_columns(df: pd.DataFrame) -> pd.DataFrame:
     This function simply calls add_all_missing_indicators so one call adds all 103.
     """
     return add_all_missing_indicators(df)
+
+
+# ====================== CRUNCHER CONTEXT (entry-only, optimization-ready) ======================
+def add_cruncher_context_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add 22 cruncher-context columns (gap, ORB, extension from 9 EMA, volume, volatility,
+    interaction terms). Entry-only, lookahead-free. Supports long format (Ticker, datetime,
+    open/high/low/close/volume) and single-ticker (DatetimeIndex, Open/High/Low/Close/Volume).
+    Uses _safe_div and _atr_normalize; computes Col_ATR14 in-group if not present.
+    """
+    df = df.copy()
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(df)
+    if not all([o_col, h_col, l_col, c_col]):
+        raise ValueError("DataFrame must have open/high/low/close (or Open/High/Low/Close)")
+
+    has_ticker = "Ticker" in df.columns
+    has_datetime_col = "datetime" in df.columns
+
+    if has_ticker:
+        sort_cols = ["Ticker"]
+        if has_datetime_col:
+            sort_cols.append("datetime")
+            if not pd.api.types.is_datetime64_any_dtype(df["datetime"]):
+                df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+    elif isinstance(df.index, pd.DatetimeIndex):
+        df = df.sort_index()
+
+    def _add_cruncher_to_group(g: pd.DataFrame) -> pd.DataFrame:
+        if len(g) == 0:
+            return g
+        o = g[o_col]
+        h = g[h_col]
+        l_ = g[l_col]
+        c = g[c_col]
+        v = g[v_col] if v_col and v_col in g.columns else None
+        idx = g.index
+
+        if "datetime" in g.columns:
+            time = pd.to_datetime(g["datetime"])
+            session_start = pd.Series(time.dt.normalize().values, index=idx)
+        else:
+            time = g.index
+            session_start = pd.Series(time.normalize(), index=idx)
+
+        if "Col_ATR14" not in g.columns:
+            atr_ser = ta.atr(h, l_, c, length=14)
+            g = g.copy()
+            g["Col_ATR14"] = atr_ser if atr_ser is not None else pd.Series(np.nan, index=idx)
+
+        prev_close = c.shift(1).fillna(c.iloc[0]) if len(c) else c.shift(1)
+        gap_pct = _safe_div(c - prev_close, prev_close) * 100
+        g["Col_Gap_Pct"] = gap_pct
+
+        # Gap fill 15 min: one value per session, then map to rows
+        def _gap_fill_15(sess):
+            mask = (time - pd.Timestamp(sess)) <= pd.Timedelta(minutes=15)
+            if not mask.any():
+                return np.nan
+            gp0 = gap_pct.loc[mask].iloc[0]
+            if pd.isna(gp0) or gp0 <= 0:
+                return 0.0 if not pd.isna(gp0) else np.nan
+            c_max = c.loc[mask].max()
+            c0 = c.loc[mask].iloc[0]
+            return float(_safe_div(pd.Series([c_max - c0]), pd.Series([gp0])).iloc[0]) * 100
+
+        sess_uniq = session_start.unique()
+        gap_fill_by_sess = pd.Series({s: _gap_fill_15(s) for s in sess_uniq})
+        g["Col_GapFill_15min_Pct"] = session_start.map(gap_fill_by_sess)
+        gap_fill_ser = gap_fill_by_sess.sort_index()
+        roll_mean = gap_fill_ser.rolling(20, min_periods=1).mean()
+        roll_std = gap_fill_ser.rolling(20, min_periods=1).std().replace(0, np.nan)
+        zscore = _safe_div(gap_fill_ser - roll_mean, roll_std)
+        g["Col_GapFill_15min_Zscore"] = session_start.map(zscore)
+
+        # ORB: per-session high/low for first N minutes, then broadcast
+        for mins in [5, 15, 30, 60]:
+            def _orb_high(s):
+                m = (time - pd.Timestamp(s)) <= pd.Timedelta(minutes=mins)
+                return h.loc[m].max() if m.any() else np.nan
+
+            def _orb_low(s):
+                m = (time - pd.Timestamp(s)) <= pd.Timedelta(minutes=mins)
+                return l_.loc[m].min() if m.any() else np.nan
+
+            orb_high_s = pd.Series({s: _orb_high(s) for s in sess_uniq})
+            orb_low_s = pd.Series({s: _orb_low(s) for s in sess_uniq})
+            orb_high_map = orb_high_s.reindex(session_start).set_axis(idx)
+            orb_low_map = orb_low_s.reindex(session_start).set_axis(idx)
+            g[f"Col_ORB_{mins}min_BreakHigh"] = (c > orb_high_map).astype(int)
+            g[f"Col_ORB_{mins}min_BreakLow"] = (c < orb_low_map).astype(int)
+            g[f"Col_ORB_{mins}min_DistHigh_ATR"] = _atr_normalize(g, c - orb_high_map)
+
+        # Extension from daily 9 EMA
+        ema9 = ta.ema(c, length=9)
+        if ema9 is not None:
+            last_ema9 = ema9.groupby(session_start).last()
+            ext_9ema = c - session_start.map(last_ema9)
+            g["Col_ExtensionFromDaily9EMA_ATR"] = _atr_normalize(g, ext_9ema)
+        else:
+            g["Col_ExtensionFromDaily9EMA_ATR"] = pd.Series(np.nan, index=idx)
+        g["Col_ExtensionFromDaily9EMA_Rank"] = g["Col_ExtensionFromDaily9EMA_ATR"].groupby(session_start).rank(pct=True) * 100
+
+        # Multi-day slope (5-day slope of 10-period daily SMA)
+        daily_close = c.groupby(session_start).last()
+        sma10 = daily_close.rolling(10, min_periods=1).mean()
+        slope_5d = (sma10 - sma10.shift(5)) / 5
+        g["Col_MultiDaySlope_5d"] = session_start.map(slope_5d)
+
+        # Inside day
+        prev_high = h.groupby(session_start).max().shift(1)
+        prev_low = l_.groupby(session_start).min().shift(1)
+        g["Col_InsideDay"] = ((h <= session_start.map(prev_high).values) & (l_ >= session_start.map(prev_low).values)).astype(int)
+
+        # Volume / liquidity
+        if v is not None:
+            avg_price = (h + l_ + c) / 3
+            daily_dollar = (avg_price * v).groupby(session_start).sum()
+            g["Col_DollarVolume_20dAvg"] = session_start.map(daily_dollar.rolling(20, min_periods=1).mean()).values
+
+            def _vol_30(s):
+                m = (time - pd.Timestamp(s)) <= pd.Timedelta(minutes=30)
+                return v.loc[m].sum() if m.any() else np.nan
+
+            vol_30_s = pd.Series({s: _vol_30(s) for s in sess_uniq})
+            avg_30 = v.groupby(session_start).sum().rolling(20, min_periods=1).mean()
+            rel_vol_30 = _safe_div(vol_30_s.reindex(session_start), avg_30.reindex(session_start))
+            g["Col_RelativeVolume_First30min"] = rel_vol_30.values
+            rank_rv = pd.Series(rel_vol_30.values, index=idx).groupby(session_start).rank(pct=True) * 100
+            g["Col_RelativeVolume_First30min_Rank"] = rank_rv.values
+
+            g["Col_VolumeSurge_1min_Ratio"] = _safe_div(v, v.rolling(20, min_periods=1).mean())
+        else:
+            g["Col_DollarVolume_20dAvg"] = np.nan
+            g["Col_RelativeVolume_First30min"] = np.nan
+            g["Col_RelativeVolume_First30min_Rank"] = np.nan
+            g["Col_VolumeSurge_1min_Ratio"] = np.nan
+
+        # Volatility
+        range_15 = (h - l_).rolling(15, min_periods=1).max()
+        g["Col_IntradayATR_Ratio"] = _safe_div(range_15, g["Col_ATR14"])
+        g["Col_StdDev_Last10Bars_ATR"] = _atr_normalize(g, c.rolling(10, min_periods=1).std())
+
+        # Interaction terms
+        g["Col_GapPct_x_RelVol30"] = gap_pct * g.get("Col_RelativeVolume_First30min", pd.Series(1.0, index=idx))
+        g["Col_GapPct_x_ExtensionATR"] = gap_pct * g.get("Col_ExtensionFromDaily9EMA_ATR", pd.Series(1.0, index=idx))
+
+        return g
+
+    if has_ticker:
+        group_col = "Ticker"
+        pieces = []
+        for name, grp in df.groupby(group_col, group_keys=False):
+            out = _add_cruncher_to_group(grp)
+            out[group_col] = name
+            pieces.append(out)
+        df = pd.concat(pieces, ignore_index=True)
+    else:
+        df = _add_cruncher_to_group(df)
+
+    return df.reset_index(drop=True) if has_ticker else df
 
