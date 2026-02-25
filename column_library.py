@@ -131,6 +131,7 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_MomentumScore_5min",
         "Col_ConsecutiveUpBars",
         "Col_BodyToRangeRatio",
+        "Col_Dojiness",
     ],
     "gaps": [
         "Col_Gap_Pct",
@@ -200,6 +201,7 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_ExtensionFromDaily9EMA_Rank",
         "Col_MultiDaySlope_5d",
         "Col_InsideDay",
+        "Col_YesterdayOpenToClosePct",
         "Col_DollarVolume_20dAvg",
         "Col_RelativeVolume_First30min",
         "Col_RelativeVolume_First30min_Rank",
@@ -649,7 +651,7 @@ def _add_volume_vwap_to_group(
     vwap_m2 = daily_vwap - 2.0 * daily_vwap_std
 
     g["Col_VWAP_Slope10_ATR"] = _atr_normalize(g, daily_vwap - daily_vwap.shift(10))
-    g["Col_VWAP_ROC5"] = daily_vwap.pct_change(5) * 100.0
+    g["Col_VWAP_ROC5"] = daily_vwap.pct_change(5, fill_method=None) * 100.0
 
     vwap_side = c >= daily_vwap
     cross_event = vwap_side.ne(vwap_side.shift(1)).fillna(False)
@@ -726,7 +728,9 @@ def _add_price_action_to_group(
     g["Col_CandleBody_vs_ATR"] = _safe_div((c - o).abs(), g["Col_ATR14"])
     g["Col_ExtensionFromOpen_ATR"] = _atr_normalize(g, c - o)
     g["Col_BodyToRangeRatio"] = (c - o).abs() / (h - l_ + 1e-8)
+    g["Col_Dojiness"] = g["Col_BodyToRangeRatio"]  # Dave Mabe alias
     up_bars = (c > o).astype(int)
+    # 0 = first bar in streak (cumcount is 0-based)
     g["Col_ConsecutiveUpBars"] = up_bars.groupby((up_bars.diff().ne(0).cumsum())).cumcount()
     g["Col_MomentumScore_5min"] = _atr_normalize(g, c - o.shift(5))
     return g
@@ -860,25 +864,25 @@ def _add_market_context_to_group(
     c = g[c_col]
     g = g.copy()
 
-    stock_ret_1d = c.pct_change()
-    stock_ret_20d = c.pct_change(20)
+    stock_ret_1d = c.pct_change(fill_method=None)
+    stock_ret_20d = c.pct_change(20, fill_method=None)
 
     spx = _pick_external_series(g, ["SPX_Close", "SPY_Close", "Benchmark_Close"])
     sector = _pick_external_series(g, ["Sector_Close", "XLK_Close", "XLF_Close", "XLY_Close", "XLI_Close"])
     spy_for_beta = _pick_external_series(g, ["SPY_Close", "SPX_Close", "Benchmark_Close"])
 
     if spx is not None:
-        g["Col_StockVsSPX_TodayPct"] = (stock_ret_1d - spx.pct_change()) * 100.0
+        g["Col_StockVsSPX_TodayPct"] = (stock_ret_1d - spx.pct_change(fill_method=None)) * 100.0
     else:
         g["Col_StockVsSPX_TodayPct"] = np.nan
 
     if sector is not None:
-        g["Col_RelStrengthVsSector_20d"] = (stock_ret_20d - sector.pct_change(20)) * 100.0
+        g["Col_RelStrengthVsSector_20d"] = (stock_ret_20d - sector.pct_change(20, fill_method=None)) * 100.0
     else:
         g["Col_RelStrengthVsSector_20d"] = np.nan
 
     if spy_for_beta is not None:
-        mkt_ret = spy_for_beta.pct_change()
+        mkt_ret = spy_for_beta.pct_change(fill_method=None)
         cov = stock_ret_1d.rolling(60).cov(mkt_ret)
         var = mkt_ret.rolling(60).var()
         g["Col_Beta60d"] = _safe_div(cov, var)
@@ -950,6 +954,7 @@ def _add_time_to_group(
         )
     else:
         g["Col_SessionFlag"] = 2
+    # Minutes since 9:00 (30 at 9:30 ET market open)
     g["Col_MinutesSinceOpen"] = np.maximum(mins_raw, 0)
     return g
 
@@ -1137,7 +1142,7 @@ def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
         g["Col_MOM10"] = ta.mom(ohlc["close"], length=10)
         g["Col_PLUS_DM14"] = dmp
         ppo_df = ta.ppo(ohlc["close"], fast=12, slow=26)
-        g["Col_PPO"] = _col(["PPO_"], ppo_df) if ppo_df is not None else np.nan
+        g["Col_PPO"] = _col(["PPO_"], ppo_df) if ppo_df is not None else pd.Series(np.nan, index=idx)
         g["Col_ROCP10"] = ta.roc(ohlc["close"], length=10)
         shifted = ohlc["close"].shift(10)
         g["Col_ROCR10"] = _safe_div(ohlc["close"], shifted)
@@ -1149,9 +1154,9 @@ def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
         g["Col_STOCHRSI_K"] = _col(["STOCHRSIk"], stochrsi_df)
         g["Col_STOCHRSI_D"] = _col(["STOCHRSId"], stochrsi_df)
         trix_df = ta.trix(ohlc["close"], length=15)
-        g["Col_TRIX15"] = _col(["TRIX"], trix_df) if trix_df is not None else np.nan
+        g["Col_TRIX15"] = _col(["TRIX"], trix_df) if trix_df is not None else pd.Series(np.nan, index=idx)
         ultosc_ser = ta.uo(ohlc["high"], ohlc["low"], ohlc["close"])
-        g["Col_ULTOSC"] = ultosc_ser if ultosc_ser is not None else np.nan
+        g["Col_ULTOSC"] = ultosc_ser if ultosc_ser is not None else pd.Series(np.nan, index=idx)
         g["Col_WILLR14"] = ta.willr(ohlc["high"], ohlc["low"], ohlc["close"], length=14)
 
         # === Price transforms ===
@@ -1164,7 +1169,7 @@ def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
         try:
             g["Col_HT_TRENDLINE"] = ta.ht_trendline(ohlc["close"])
         except Exception:
-            g["Col_HT_TRENDLINE"] = np.nan
+            g["Col_HT_TRENDLINE"] = pd.Series(np.nan, index=idx)
         for col, fn, args in [
             ("Col_HT_DCPERIOD", "ht_dcperiod", ()),
             ("Col_HT_DCPHASE", "ht_dcphase", ()),
@@ -1174,11 +1179,11 @@ def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
             if fn_obj is not None:
                 try:
                     r = fn_obj(ohlc["close"], *args)
-                    g[col] = r if r is not None else np.nan
+                    g[col] = r if r is not None else pd.Series(np.nan, index=idx)
                 except Exception:
-                    g[col] = np.nan
+                    g[col] = pd.Series(np.nan, index=idx)
             else:
-                g[col] = np.nan
+                g[col] = pd.Series(np.nan, index=idx)
         phasor_fn = getattr(ta, "ht_phasor", None)
         if phasor_fn is not None:
             try:
@@ -1186,9 +1191,9 @@ def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
                 g["Col_HT_PHASOR_INPHASE"] = _col(["INPHASE"], phasor_df)
                 g["Col_HT_PHASOR_QUADRATURE"] = _col(["QUADRATURE"], phasor_df)
             except Exception:
-                g["Col_HT_PHASOR_INPHASE"] = g["Col_HT_PHASOR_QUADRATURE"] = np.nan
+                g["Col_HT_PHASOR_INPHASE"] = g["Col_HT_PHASOR_QUADRATURE"] = pd.Series(np.nan, index=idx)
         else:
-            g["Col_HT_PHASOR_INPHASE"] = g["Col_HT_PHASOR_QUADRATURE"] = np.nan
+            g["Col_HT_PHASOR_INPHASE"] = g["Col_HT_PHASOR_QUADRATURE"] = pd.Series(np.nan, index=idx)
         sine_fn = getattr(ta, "ht_sine", None)
         if sine_fn is not None:
             try:
@@ -1196,18 +1201,18 @@ def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
                 g["Col_HT_SINE_SINE"] = _col(["SINE"], sine_df)
                 g["Col_HT_SINE_LEADSINE"] = _col(["LEADSINE"], sine_df)
             except Exception:
-                g["Col_HT_SINE_SINE"] = g["Col_HT_SINE_LEADSINE"] = np.nan
+                g["Col_HT_SINE_SINE"] = g["Col_HT_SINE_LEADSINE"] = pd.Series(np.nan, index=idx)
         else:
-            g["Col_HT_SINE_SINE"] = g["Col_HT_SINE_LEADSINE"] = np.nan
+            g["Col_HT_SINE_SINE"] = g["Col_HT_SINE_LEADSINE"] = pd.Series(np.nan, index=idx)
 
         # === Linear Regression ===
         g["Col_LINEARREG20"] = ta.linreg(ohlc["close"], length=20)
         lra = ta.linreg(ohlc["close"], length=20, angle=True)
-        g["Col_LINEARREG_ANGLE20"] = lra if lra is not None else np.nan
+        g["Col_LINEARREG_ANGLE20"] = lra if lra is not None else pd.Series(np.nan, index=idx)
         lri = ta.linreg(ohlc["close"], length=20, intercept=True)
-        g["Col_LINEARREG_INTERCEPT20"] = lri if lri is not None else np.nan
+        g["Col_LINEARREG_INTERCEPT20"] = lri if lri is not None else pd.Series(np.nan, index=idx)
         lrs = ta.linreg(ohlc["close"], length=20, slope=True)
-        g["Col_LINEARREG_SLOPE20"] = lrs if lrs is not None else np.nan
+        g["Col_LINEARREG_SLOPE20"] = lrs if lrs is not None else pd.Series(np.nan, index=idx)
         g["Col_STDDEV20"] = ta.stdev(ohlc["close"], length=20)
         g["Col_VAR20"] = ta.variance(ohlc["close"], length=20)
 
@@ -1229,21 +1234,21 @@ def add_all_missing_indicators(df: pd.DataFrame) -> pd.DataFrame:
             g["Col_Ichimoku_Chikou"] = _col(["ICS"], main_ichi)
         else:
             for col in ["Col_Ichimoku_Tenkan", "Col_Ichimoku_Kijun", "Col_Ichimoku_SenkouA", "Col_Ichimoku_SenkouB", "Col_Ichimoku_Chikou"]:
-                g[col] = np.nan
+                g[col] = pd.Series(np.nan, index=idx)
 
         g["Col_PivotPoint"] = (ohlc["high"] + ohlc["low"] + ohlc["close"]) / 3
 
         ao_ser = ta.ao(ohlc["high"], ohlc["low"])
-        g["Col_AwesomeOscillator"] = ao_ser if ao_ser is not None else np.nan
+        g["Col_AwesomeOscillator"] = ao_ser if ao_ser is not None else pd.Series(np.nan, index=idx)
         if ao_ser is not None:
             ao_sma = ta.sma(ao_ser, length=5)
             g["Col_AccelerationDeceleration"] = ao_ser - ao_sma if ao_sma is not None else ao_ser
         else:
-            g["Col_AccelerationDeceleration"] = np.nan
+            g["Col_AccelerationDeceleration"] = pd.Series(np.nan, index=idx)
 
         g["Col_DPO"] = ta.dpo(ohlc["close"], length=20)
         kst_df = ta.kst(ohlc["close"])
-        g["Col_KST"] = _col(["KST_"], kst_df) if kst_df is not None else np.nan
+        g["Col_KST"] = _col(["KST_"], kst_df) if kst_df is not None else pd.Series(np.nan, index=idx)
 
         g["Col_PercentRank20"] = ohlc["close"].rolling(20).rank(pct=True) * 100
 
@@ -1442,6 +1447,14 @@ def add_cruncher_context_columns(df: pd.DataFrame) -> pd.DataFrame:
             & (day_low_so_far >= session_start.map(prev_low).values)
         ).astype(int)
 
+        # Yesterday's open-to-close return (Dave Mabe alias; lookahead-free)
+        daily_open = o.groupby(session_start).first()
+        daily_close = c.groupby(session_start).last()
+        prev_open = daily_open.shift(1)
+        prev_close = daily_close.shift(1)
+        yesterday_ret = _safe_div(prev_close - prev_open, prev_open) * 100.0
+        g["Col_YesterdayOpenToClosePct"] = session_start.map(yesterday_ret)
+
         # Volume / liquidity
         if v is not None:
             avg_price = (h + l_ + c) / 3
@@ -1486,8 +1499,8 @@ def add_cruncher_context_columns(df: pd.DataFrame) -> pd.DataFrame:
             g["Col_DistFromSessionVWAP_ATR"] = pd.Series(np.nan, index=idx)
         rsi = g["Col_RSI14"] if "Col_RSI14" in g.columns else ta.rsi(c, length=14)
         if rsi is not None:
-            price_change = c.pct_change().replace([np.inf, -np.inf], np.nan)
-            rsi_change = rsi.pct_change().replace([np.inf, -np.inf], np.nan)
+            price_change = c.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+            rsi_change = rsi.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
             g["Col_MomentumDivergence_RSI"] = (rsi_change - price_change).replace([np.inf, -np.inf], np.nan)
         else:
             g["Col_MomentumDivergence_RSI"] = pd.Series(np.nan, index=idx)

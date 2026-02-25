@@ -1,70 +1,30 @@
 # column_library.py — Deep Logic & Bug Audit (Updated)
 
-**Date:** 2026-02-19  
-**Scope:** Full logic and bug audit after long-format refactor
+**Date:** 2026-02-26  
+**Scope:** Post–bafc061 audit; critical lookahead and robustness fixed.
 
 ---
 
 ## Executive Summary
 
-The library supports both long format and single-ticker. Several **critical lookahead bugs** remain in cruncher columns. New issues from the long-format refactor include pandas_ta None handling and VWAP fallback semantics. One **logic bug** in Inside Day. Minor robustness issues noted.
+The library supports both long format and single-ticker. **All critical lookahead bugs and key robustness issues are fixed in commit bafc061.** Minor documentation and consistency items remain (see Minor section).
 
 ---
 
-## Critical — Lookahead (Invalid for Backtesting)
+### Fixed in bafc061 (lookahead & robustness)
 
-### 1. Col_ExtensionFromDaily9EMA_ATR — uses end-of-session EMA
+- **Col_ExtensionFromDaily9EMA_*** → bar-level EMA (no EOD `.last()`); fixed.
+- **Col_MultiDaySlope_5d** → prior-session only (`sma10.shift(1) - sma10.shift(6)`); fixed.
+- **Col_InsideDay** → day-so-far cummax/cummin vs previous day range; fixed.
+- **g.copy()** at start of `_add_cruncher_to_group`; fixed.
+- **ta.\*** None handling (atr, true_range, rsi, bbands, obv, ad); fixed.
+- **VWAP fallback** → per-session cumsum when `ta.vwap` returns None; fixed.
 
-**Location:** `_add_cruncher_to_group`, lines 1347–1353
-
-**Issue:** Uses `ema9.groupby(session_start).last()` — the **last** (end-of-session) EMA value mapped to every bar. At 10:00 AM, the bar gets the 4:00 PM EMA.
-
-**Fix:** Use the bar's own EMA:
-```python
-ext_9ema = c - ema9
-g["Col_ExtensionFromDaily9EMA_ATR"] = _atr_normalize(g, ext_9ema)
-```
-Col_ExtensionFromDaily9EMA_Rank inherits this lookahead.
+Library is now fully lookahead-free for 1m+ data when used as intended.
 
 ---
 
-### 2. Col_MultiDaySlope_5d — uses today's closing price intraday
-
-**Location:** `_add_cruncher_to_group`, lines 1356–1359
-
-**Issue:** `daily_close = c.groupby(session_start).last()` — at 10:00 AM on day D, `slope_5d` uses `daily_close[D]` (today's closing price), which is not known until EOD.
-
-**Fix:** Use only prior sessions:
-```python
-daily_close = c.groupby(session_start).last()
-sma10 = daily_close.rolling(10, min_periods=1).mean()
-slope_5d = (sma10.shift(1) - sma10.shift(6)) / 5
-g["Col_MultiDaySlope_5d"] = session_start.map(slope_5d)
-```
-
----
-
-## Logic Bugs
-
-### 3. Col_InsideDay — wrong definition for minute bars
-
-**Location:** `_add_cruncher_to_group`, lines 1362–1364
-
-**Issue:** Uses `h` and `l_` (current bar's high/low), not the day's high/low so far. For minute bars, need cumulative day range.
-
-**Fix:**
-```python
-day_high_so_far = h.groupby(session_start).cummax()
-day_low_so_far = l_.groupby(session_start).cummin()
-prev_high = h.groupby(session_start).max().shift(1)
-prev_low = l_.groupby(session_start).min().shift(1)
-g["Col_InsideDay"] = ((day_high_so_far <= session_start.map(prev_high).values)
-                      & (day_low_so_far >= session_start.map(prev_low).values)).astype(int)
-```
-
----
-
-## Medium — Robustness / Edge Cases
+## Medium — Robustness / Edge Cases (Historical; most fixed in bafc061)
 
 ### 4. _add_cruncher_to_group — no defensive copy
 
@@ -217,19 +177,18 @@ if daily_vwap is None:
 
 ## Summary of Recommended Fixes
 
-| Priority | Item | Action |
+| Priority | Item | Status |
 |----------|------|--------|
-| **Critical** | ExtensionFromDaily9EMA | Use bar-level ema9, not session .last() |
-| **Critical** | MultiDaySlope_5d | Use only prior-session closes |
-| **Logic** | InsideDay | Use cummax/cummin for day range so far |
-| **Medium** | _add_cruncher_to_group | Add g.copy() at start |
-| **Medium** | _add_volatility_to_group | Handle ta.atr, ta.true_range None |
-| **Medium** | _add_oscillator_to_group | Handle ta.rsi None |
-| **Medium** | VWAP fallback | Use session-weighted cumsum when ta.vwap returns None |
+| **Critical** | ExtensionFromDaily9EMA | **FIXED** bafc061 |
+| **Critical** | MultiDaySlope_5d | **FIXED** bafc061 |
+| **Logic** | InsideDay | **FIXED** bafc061 |
+| **Medium** | _add_cruncher_to_group g.copy() | **FIXED** bafc061 |
+| **Medium** | ta.atr / true_range / rsi / bbands / obv / ad None | **FIXED** bafc061 |
+| **Medium** | VWAP fallback per-session | **FIXED** bafc061 |
 | **Minor** | pct_change | Use fill_method=None to silence FutureWarning |
-| **Minor** | ConsecutiveUpBars | Document or use cumcount()+1 |
-| **Minor** | Col_CumulativeVol_vs_Avg_Pct | Document formula |
-| **Minor** | Col_MinutesSinceOpen | Document 9:00 assumption |
+| **Minor** | ConsecutiveUpBars | Document 0 = first bar in streak |
+| **Minor** | Col_MinutesSinceOpen | Document 9:30 open assumption |
+| **Minor** | add_all_missing_indicators scalar np.nan | Use pd.Series(np.nan, index=idx) |
 
 ---
 
