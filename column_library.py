@@ -414,7 +414,8 @@ def _add_volatility_to_group(
     """Add volatility columns to one ticker's group. Works with DatetimeIndex or datetime column."""
     h, l_, c = g[h_col], g[l_col], g[c_col]
     g = g.copy()
-    g["Col_ATR14"] = ta.atr(h, l_, c, length=14)
+    atr_ser = ta.atr(h, l_, c, length=14)
+    g["Col_ATR14"] = atr_ser if atr_ser is not None else pd.Series(np.nan, index=g.index)
     g["Col_NormalizedATR_Pct"] = _safe_div(g["Col_ATR14"], c) * 100.0
     g["Col_ATR_vs_20dayAvg_Pct"] = _safe_div(g["Col_ATR14"], g["Col_ATR14"].rolling(20).mean()) * 100.0
     g["Col_ATR14_vs_5dayAvg_Pct"] = _safe_div(g["Col_ATR14"], g["Col_ATR14"].rolling(5).mean()) * 100.0
@@ -423,6 +424,8 @@ def _add_volatility_to_group(
     g["Col_HistoricalVol_20day"] = log_ret.rolling(20).std() * np.sqrt(252.0) * 100.0
 
     true_range = ta.true_range(h, l_, c)
+    if true_range is None:
+        true_range = pd.Series(np.nan, index=g.index)
     g["Col_TrueRange_vs_ATR"] = _safe_div(true_range, g["Col_ATR14"])
     g["Col_DailyRange_vs_ATR_Pct"] = _safe_div(h - l_, g["Col_ATR14"]) * 100.0
     daily_range = h - l_
@@ -534,7 +537,8 @@ def _add_oscillator_to_group(
     if "Col_ATR14" not in g.columns:
         g = _add_volatility_to_group(g, o_col, h_col, l_col, c_col, v_col)
 
-    g["Col_RSI14"] = ta.rsi(c, length=14)
+    rsi_ser = ta.rsi(c, length=14)
+    g["Col_RSI14"] = rsi_ser if rsi_ser is not None else pd.Series(np.nan, index=g.index)
 
     stoch_df = ta.stoch(h, l_, c, k=14, d=3, smooth_k=3)
     g["Col_StochK_14_3"] = _indicator_col(
@@ -547,8 +551,11 @@ def _add_oscillator_to_group(
     g["Col_CCI20"] = ta.cci(h, l_, c, length=20)
 
     bb = ta.bbands(c, length=20, std=2.0)
-    bb_low = _indicator_col(bb, g.index, exact_names=["BBL_20_2.0"], starts_with=["BBL_"])
-    bb_up = _indicator_col(bb, g.index, exact_names=["BBU_20_2.0"], starts_with=["BBU_"])
+    if bb is None or bb.empty:
+        bb_low = bb_up = pd.Series(np.nan, index=g.index)
+    else:
+        bb_low = _indicator_col(bb, g.index, exact_names=["BBL_20_2.0"], starts_with=["BBL_"])
+        bb_up = _indicator_col(bb, g.index, exact_names=["BBU_20_2.0"], starts_with=["BBU_"])
     g["Col_BollingerPctB"] = _safe_div(c - bb_low, bb_up - bb_low)
     g["Col_DistUpperBB_ATR"] = _atr_normalize(g, c - bb_up)
     g["Col_DistLowerBB_ATR"] = _atr_normalize(g, c - bb_low)
@@ -619,13 +626,18 @@ def _add_volume_vwap_to_group(
     g["Col_TradeCount_5min"] = np.nan
 
     obv = ta.obv(c, v)
+    if obv is None:
+        obv = pd.Series(np.nan, index=g.index)
     g["Col_OBV_Slope5"] = _safe_div(obv - obv.shift(5), g["Col_ATR14"])
-    g["Col_AccumDist"] = ta.ad(h, l_, c, v)
+    ad_ser = ta.ad(h, l_, c, v)
+    g["Col_AccumDist"] = ad_ser if ad_ser is not None else pd.Series(np.nan, index=g.index)
 
     daily_vwap = ta.vwap(h, l_, c, v, anchor="D")
     weekly_vwap = ta.vwap(h, l_, c, v, anchor="W")
     if daily_vwap is None:
-        daily_vwap = _safe_div((typical * v).cumsum(), v.cumsum())
+        cum_pv = (typical * v).groupby(session).cumsum()
+        cum_v = v.groupby(session).cumsum()
+        daily_vwap = _safe_div(cum_pv, cum_v)
     if weekly_vwap is None:
         weekly_vwap = daily_vwap
 
@@ -1343,6 +1355,7 @@ def add_cruncher_context_columns(df: pd.DataFrame) -> pd.DataFrame:
     def _add_cruncher_to_group(g: pd.DataFrame) -> pd.DataFrame:
         if len(g) == 0:
             return g
+        g = g.copy()
         o = g[o_col]
         h = g[h_col]
         l_ = g[l_col]
@@ -1359,7 +1372,6 @@ def add_cruncher_context_columns(df: pd.DataFrame) -> pd.DataFrame:
 
         if "Col_ATR14" not in g.columns:
             atr_ser = ta.atr(h, l_, c, length=14)
-            g = g.copy()
             g["Col_ATR14"] = atr_ser if atr_ser is not None else pd.Series(np.nan, index=idx)
 
         prev_close = c.shift(1).fillna(c.iloc[0]) if len(c) else c.shift(1)
@@ -1405,26 +1417,30 @@ def add_cruncher_context_columns(df: pd.DataFrame) -> pd.DataFrame:
             g[f"Col_ORB_{mins}min_BreakLow"] = (c < orb_low_map).astype(int)
             g[f"Col_ORB_{mins}min_DistHigh_ATR"] = _atr_normalize(g, c - orb_high_map)
 
-        # Extension from daily 9 EMA
+        # Extension from 9-period EMA (bar-level, lookahead-free; not EOD)
         ema9 = ta.ema(c, length=9)
         if ema9 is not None:
-            last_ema9 = ema9.groupby(session_start).last()
-            ext_9ema = c - session_start.map(last_ema9)
+            ext_9ema = c - ema9
             g["Col_ExtensionFromDaily9EMA_ATR"] = _atr_normalize(g, ext_9ema)
         else:
             g["Col_ExtensionFromDaily9EMA_ATR"] = pd.Series(np.nan, index=idx)
         g["Col_ExtensionFromDaily9EMA_Rank"] = g["Col_ExtensionFromDaily9EMA_ATR"].groupby(session_start).rank(pct=True) * 100
 
-        # Multi-day slope (5-day slope of 10-period daily SMA)
+        # Multi-day slope (5-day slope of 10-period daily SMA; past days only, no today)
         daily_close = c.groupby(session_start).last()
         sma10 = daily_close.rolling(10, min_periods=1).mean()
-        slope_5d = (sma10 - sma10.shift(5)) / 5
+        slope_5d = (sma10.shift(1) - sma10.shift(6)) / 5
         g["Col_MultiDaySlope_5d"] = session_start.map(slope_5d)
 
-        # Inside day
+        # Inside day: day-so-far high/low vs previous day's range (minute-safe)
+        day_high_so_far = h.groupby(session_start).cummax()
+        day_low_so_far = l_.groupby(session_start).cummin()
         prev_high = h.groupby(session_start).max().shift(1)
         prev_low = l_.groupby(session_start).min().shift(1)
-        g["Col_InsideDay"] = ((h <= session_start.map(prev_high).values) & (l_ >= session_start.map(prev_low).values)).astype(int)
+        g["Col_InsideDay"] = (
+            (day_high_so_far <= session_start.map(prev_high).values)
+            & (day_low_so_far >= session_start.map(prev_low).values)
+        ).astype(int)
 
         # Volume / liquidity
         if v is not None:
