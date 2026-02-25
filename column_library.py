@@ -1,8 +1,13 @@
 """
 ===========================================================================
-# ENTRY-ONLY COLUMN LIBRARY — ~216 columns (67 core + 103 indicators + 25 cruncher + 18 advanced cruncher)
+# COLUMN LIBRARY — Entry, Exit, and Continuous sections (~216 columns)
 ===========================================================================
 Portable Column Library (single-file, reusable across backtesting projects)
+
+Sections:
+  - ENTRY COLUMNS: snapshot at entry bar (all feature columns from _COLUMN_GROUPS).
+  - EXIT COLUMNS: snapshot at exit bar = all entry columns + any exit-only names (same list by default).
+  - CONTINUOUS COLUMNS: tracked during the trade (Entry/Exit/Max/Min/At30min/At60min) via add_continuous_tracking.
 
 Dependencies:
     pip install pandas numpy pandas_ta
@@ -16,12 +21,15 @@ Usage example:
         add_final_22_missing_columns,
         add_cruncher_context_columns,
         add_advanced_cruncher_columns,
+        add_gemini_improved_columns,
         add_continuous_tracking,
         get_minute_by_minute_tracking,
         add_volatility_columns,
         add_volume_vwap_columns,
         get_all_column_names,
         get_column_groups,
+        ENTRY_COLUMNS,
+        EXIT_SNAPSHOT_COLUMNS,
         CONTINUOUS_TRACKING_COLUMNS,
     )
 
@@ -223,6 +231,13 @@ _COLUMN_GROUPS: Dict[str, List[str]] = {
         "Col_ExtensionATR_x_VolContraction",
         "Col_DistFrom5DayMean_ATR",
         "Col_ConsecutiveGapDays",
+    ],
+    "gemini_improved": [
+        "Col_Arval_TimeOfDay",
+        "Col_PctIn20DayRange",
+        "Col_PctIn52WeekRange",
+        "Col_LogicalStop_ATR",
+        "Col_LogicalTarget_ATR",
     ],
 }
 
@@ -979,6 +994,7 @@ def add_full_enrichment(df: pd.DataFrame) -> pd.DataFrame:
     df = add_all_missing_indicators(df)
     df = add_cruncher_context_columns(df)
     df = add_advanced_cruncher_columns(df)
+    df = add_gemini_improved_columns(df)
     return df
 
 
@@ -992,6 +1008,18 @@ def get_all_column_names() -> List[str]:
 
 def get_column_groups() -> Dict[str, List[str]]:
     return {k: v.copy() for k, v in _COLUMN_GROUPS.items()}
+
+
+# ====================== ENTRY COLUMNS ======================
+# All feature columns available at entry bar (snapshot at entry time). Deduped to preserve order.
+ENTRY_COLUMNS: List[str] = list(dict.fromkeys(get_all_column_names()))
+
+
+# ====================== EXIT COLUMNS ======================
+# Columns to snapshot at exit bar. By default = all entry columns (so every entry feature is also recorded at exit).
+# Add any exit-only column names to EXIT_ONLY_COLUMNS if needed; EXIT_SNAPSHOT_COLUMNS = ENTRY + EXIT_ONLY.
+EXIT_ONLY_COLUMNS: List[str] = []  # e.g. engine-computed exit metrics can be named here for reference
+EXIT_SNAPSHOT_COLUMNS: List[str] = list(ENTRY_COLUMNS) + list(EXIT_ONLY_COLUMNS)
 
 
 # ====================== 78 MISSING INDICATORS (TA-Lib non-CDL + Backtrader uniques) ======================
@@ -1627,8 +1655,78 @@ def add_advanced_cruncher_columns(df: pd.DataFrame) -> pd.DataFrame:
     return _add_advanced_to_group(df)
 
 
-# ====================== CONTINUOUS INTRATRADE TRACKING ======================
-# Columns to track every minute while position is open (Entry / Exit / Max / Min / At30min / At60min)
+def add_gemini_improved_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Gemini-inspired improvements: Time-of-day Arval, better Position in Range,
+    and consistent ATR-normalized stop/target helpers.
+    Adds: Col_Arval_TimeOfDay, Col_PctIn20DayRange, Col_PctIn52WeekRange,
+    Col_LogicalStop_ATR, Col_LogicalTarget_ATR.
+    """
+    df = df.copy()
+    o_col, h_col, l_col, c_col, v_col = _pick_ohlcv_columns(df)
+    if not all([o_col, h_col, l_col, c_col, v_col]):
+        return df
+
+    has_ticker = "Ticker" in df.columns
+    if has_ticker:
+        sort_cols = ["Ticker", "datetime"] if "datetime" in df.columns else ["Ticker"]
+        if "datetime" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["datetime"]):
+            df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+    elif isinstance(df.index, pd.DatetimeIndex):
+        df = df.sort_index()
+
+    def _add_to_group(g: pd.DataFrame) -> pd.DataFrame:
+        idx = g.index if isinstance(g.index, pd.DatetimeIndex) else pd.RangeIndex(len(g))
+        session_start = _session_labels_for_group(g)
+        if "datetime" in g.columns:
+            dt = pd.to_datetime(g["datetime"])
+            minutes_idx = dt.dt.hour * 60 + dt.dt.minute
+        else:
+            minutes_idx = idx.hour * 60 + idx.minute
+
+        v = g[v_col]
+        h = g[h_col]
+        l_ = g[l_col]
+        c = g[c_col]
+
+        # 1. True Time-of-Day Arval (same-minute comparison)
+        cum_vol_today = v.groupby(session_start).cumsum()
+        avg_cum_vol = cum_vol_today.groupby(minutes_idx).transform(
+            lambda x: x.rolling(20, min_periods=5).mean()
+        )
+        g["Col_Arval_TimeOfDay"] = _safe_div(cum_vol_today, avg_cum_vol)
+
+        # 2. Improved Position in Range (20-day and 52-week)
+        bars_per_day = 390
+        roll20_high = h.rolling(20 * bars_per_day).max()
+        roll20_low = l_.rolling(20 * bars_per_day).min()
+        g["Col_PctIn20DayRange"] = _safe_div(c - roll20_low, roll20_high - roll20_low) * 100.0
+
+        roll52w_high = h.rolling(252 * bars_per_day).max()
+        roll52w_low = l_.rolling(252 * bars_per_day).min()
+        g["Col_PctIn52WeekRange"] = _safe_div(c - roll52w_low, roll52w_high - roll52w_low) * 100.0
+
+        # 3. ATR-normalized stop/target helpers (requires Col_ExtensionFromDaily9EMA_ATR)
+        ext9 = g.get("Col_ExtensionFromDaily9EMA_ATR", pd.Series(0.0, index=idx))
+        g["Col_LogicalStop_ATR"] = ext9 - 1.5
+        g["Col_LogicalTarget_ATR"] = ext9 + 3.0
+
+        return g
+
+    if has_ticker:
+        pieces = []
+        for name, grp in df.groupby("Ticker", group_keys=False):
+            g = _add_to_group(grp)
+            g["Ticker"] = name
+            pieces.append(g)
+        return pd.concat(pieces, ignore_index=True)
+    return _add_to_group(df)
+
+
+# ====================== CONTINUOUS COLUMNS ======================
+# Columns to track every minute while position is open (Entry / Exit / Max / Min / At30min / At60min).
+# Use add_continuous_tracking(df_enriched, trades) to attach _Entry, _Exit, _Max, _Min, _At{N}min.
 CONTINUOUS_TRACKING_COLUMNS: List[str] = [
     "Col_ExtensionFromDaily9EMA_ATR",
     "Col_VWAP_Deviation_ATR",
